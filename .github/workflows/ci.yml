@@ -44,7 +44,7 @@ jobs:
       - name: Validate committed dependency locks without resolution
         run: python scripts/validate_dependency_locks.py
       - name: Validate workflow policy
-        run: ./scripts/validate_workflows.py
+        run: python scripts/validate_workflows.py
       - name: Run Ruff
         run: ruff check .
       - name: Run Django checks
