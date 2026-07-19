@@ -1,8 +1,9 @@
 # ThreatBridge
 
-ThreatBridge is a vendor-neutral, threat-informed evidence and correlation application. It imports threat intelligence, asset inventory, software, vulnerability findings, detections, telemetry, and validation results; preserves the original source evidence; then produces explainable threat-to-control gap assessments.
+ThreatBridge is a vendor-neutral, threat-informed evidence and correlation application. It imports threat intelligence, asset inventory, software, vulnerability findings, detections, telemetry, and validation results; stores the latest hashed source record with provenance; then produces explainable threat-to-control gap assessments.
 
-This repository is a runnable MVP. It is intentionally read-only toward external security products.
+This repository is a runnable single-deployment MVP, not a production-ready or public-release-ready
+system. It is intentionally read-only toward external security products.
 
 ## What is included
 
@@ -12,6 +13,8 @@ This repository is a runnable MVP. It is intentionally read-only toward external
 - Idempotent synchronization, durable cursors, run history, and per-record error isolation
 - Explainable assessment engine for exposure, telemetry, detection, and validation gaps
 - Analyst review workflow for ATT&CK mappings in threat reports
+- Central named-permission policy and structured, redacted security audit events
+- Recoverable source-evidence deletion with independently permissioned restoration
 - Bounded, format-validated CSV, JSON, JSONL, and NDJSON ingestion
 - Schema preview, automatic object-type suggestions, field-map suggestions, and composite record IDs
 - Reusable file-import profiles and a command-line import workflow
@@ -70,7 +73,7 @@ password, set `DJANGO_DEBUG=false`, and provide `DJANGO_SECRET_KEY` explicitly.
 
 ## Importing CSV and JSON
 
-Staff users can open `/imports/new/` and:
+Users granted `integrations.import_source_file` can open `/imports/new/` and:
 
 1. Select a CSV, JSON, JSONL, or NDJSON file.
 2. Preview the record count, fields, and sample objects.
@@ -187,21 +190,23 @@ Refresh an existing reusable profile with a new export by supplying its slug:
 python manage.py import_source_file ./new-export.csv --profile asset-inventory-export
 ```
 
-Use `python manage.py import_source_file --help` for records-key, delimiter, review-state,
-strict-record, and no-sync options.
+Use `python manage.py import_source_file --help` for records-key, delimiter, strict-record, and
+no-sync options. ATT&CK mappings embedded in any imported threat report always begin pending.
 
 ## Authenticated file upload
 
-Only staff users can preview or import files.
+Only users with `integrations.import_source_file` can preview or import files. Django staff status
+alone does not grant this or any other application workflow.
 
 Sign in through `/accounts/login/`, then open `/imports/new/` to preview, import, and
 synchronize a file with the authenticated browser session. This keeps the password out of
 source files, shell history, and process arguments.
 
-The current release does not provide a production-ready authentication method for unattended
-REST API automation. Do not automate the file-upload API with command-line passwords; use the
-browser workflow or the management command below until a replacement API authentication method
-is implemented.
+The REST API accepts authenticated Django browser sessions only. HTTP Basic Authentication is
+disabled, and unsafe session-authenticated API requests require CSRF protection. The current
+release does not provide production-ready unattended API authentication. Do not automate the API
+with command-line passwords; use the browser workflow or an appropriately controlled management
+command until a replacement authentication method is designed.
 
 ### Command-line file import
 
@@ -225,6 +230,10 @@ Other authenticated API operations:
 - `GET /api/sync-runs/`
 - `GET /api/external-objects/`
 - `GET /api/catalog/`
+
+Integration viewing, configuration, testing, synchronization, imports, assessments, ATT&CK review,
+restricted/deleted evidence, restoration, and audit-event access each have separate named
+permissions. See [`docs/authorization-model.md`](docs/authorization-model.md).
 
 ## Normalized object types
 
@@ -289,11 +298,23 @@ See [`docs/integration-contract.md`](docs/integration-contract.md) for the adapt
 | `DJANGO_SECRET_KEY` | Django signing key; required outside development | Generated in `.secrets/` during development |
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated hosts | `localhost,127.0.0.1` |
 | `DJANGO_CSRF_TRUSTED_ORIGINS` | Comma-separated origins | Empty |
+| `DJANGO_SECURE_HSTS_SECONDS` | Explicit production HSTS duration | Required in production |
+| `DJANGO_TRUST_X_FORWARDED_PROTO` | Trust a stripping proxy's forwarded HTTPS header | `false` |
 | `DJANGO_TIME_ZONE` | Display/default timezone | `UTC` |
 | `DATABASE_URL` | SQLite or PostgreSQL connection | Local SQLite |
 | `THREATBRIDGE_DATA_DIR` | Connector and upload data directory | `./data` |
 | `THREATBRIDGE_MAX_UPLOAD_BYTES` | Multipart file-size limit | `52428800` |
 | `THREATBRIDGE_MAX_IMPORT_RECORDS` | Records allowed in one file import | `100000` |
+| `THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES` | Maximum connector response body | `10485760` |
+| `THREATBRIDGE_MAX_JSON_DEPTH` | Maximum imported JSON nesting | `20` |
+| `THREATBRIDGE_MAX_OBJECT_FIELDS` | Maximum fields in one JSON object | `500` |
+| `THREATBRIDGE_MAX_FIELD_NAME_LENGTH` | Maximum imported field-name length | `200` |
+| `THREATBRIDGE_MAX_SCALAR_LENGTH` | Maximum imported JSON string length | `100000` |
+| `THREATBRIDGE_MAX_CSV_COLUMNS` | Maximum CSV columns | `500` |
+| `THREATBRIDGE_MAX_CSV_FIELD_LENGTH` | Maximum CSV field length | `100000` |
+| `THREATBRIDGE_MAX_JSONL_LINE_BYTES` | Maximum JSONL/NDJSON line bytes | `1048576` |
+| `THREATBRIDGE_MAX_PREVIEW_SAMPLES` | Maximum preview records returned | `5` |
+| `THREATBRIDGE_MAX_IMPORT_ERRORS` | Maximum per-record errors retained per run | `100` |
 | `THREATBRIDGE_MAX_PAGES_PER_SYNC` | Connector page guardrail | `50` |
 | `THREATBRIDGE_ALLOWED_ADAPTER_PREFIXES` | Allowed Python adapter namespaces | `integrations.adapters.` |
 | `THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS` | Exact connector destination hostnames or IP literals | Empty |
@@ -302,24 +323,35 @@ See [`docs/integration-contract.md`](docs/integration-contract.md) for the adapt
 ## Security boundaries
 
 - External integrations are read-only by design.
-- File uploads are restricted to staff users, accepted extensions, configured size/record limits, and a server-controlled path under `THREATBRIDGE_DATA_DIR`.
+- File uploads require a named permission and enforce byte, record, structure, nesting, field,
+  line, preview, and retained-error limits under a server-controlled path.
 - Uploaded filenames are not used as storage paths; ThreatBridge generates random names and stores the original name as metadata.
 - Credentials are not stored in integration configuration. `secret_reference` resolves credentials from an external source such as environment variables.
 - Every connector destination requires an exact outbound-host allowlist entry. Private destinations additionally require every DNS answer to fall within an explicitly allowed private CIDR.
+- Connector response bodies are bounded before complete in-memory loading, and stored/displayed
+  connector failures omit bodies, query strings, headers, and resolved secrets.
 - Each `ExternalObject` row retains the latest raw and normalized version for its integration/type/external-ID key, with a content hash and provenance timestamps; it is not an append-only version history.
+- Imported, synchronized, manually entered, API-created, and reprojected ATT&CK mappings always
+  begin pending; only the review service can approve or reject them.
+- Deleted evidence is hidden from ordinary views, APIs, projections, reprojection, and assessment;
+  restoration requires a separate permission and both lifecycle actions are audited.
+- Assessments record complete active-evidence provenance; legacy assessments without that manifest
+  remain hidden until explicitly recalculated.
+- Security audit events and ATT&CK review events are append-only through application and admin
+  paths, with bounded redacted metadata.
 - Write-back, automatic blocking, rule deployment, scan execution, and remediation are outside the MVP.
 - Do not ingest PHI, patient records, secrets, access tokens, or private keys.
 - Malware scanning and quarantine are not implemented. Production deployments must add both before accepting untrusted uploads.
 
-For production, add enterprise SSO, a managed secret provider, centralized logging, backup/restore, asynchronous workers for large imports, retention controls, and organization-specific authorization scopes.
+Production requirements and fail-closed settings are documented in
+[`docs/deployment-hardening.md`](docs/deployment-hardening.md). Tenant isolation, organization
+scoping, Entra ID/enterprise SSO, full TLP enforcement, automatic policy decisions, connector
+write-back, and automatic remediation are not implemented.
 
 ## Tests and checks
 
 ```bash
-ruff check threatbridge integrations catalog
-python manage.py check
-python manage.py makemigrations --check --dry-run
-pytest -q
+bash scripts/security_check.sh
 ```
 
 A clean smoke test can also be run with:

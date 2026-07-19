@@ -11,6 +11,7 @@ from django.core.management.base import BaseCommand, CommandError
 from integrations.file_imports import create_file_import
 from integrations.import_schemas import IMPORT_OBJECT_TYPE_CHOICES
 from integrations.models import Integration
+from integrations.secrets import sanitized_connector_error
 
 
 class Command(BaseCommand):
@@ -52,11 +53,6 @@ class Command(BaseCommand):
             "--delimiter",
             default="",
             help="CSV delimiter. Leave blank to auto-detect; use \\t for a tab",
-        )
-        parser.add_argument(
-            "--review-status",
-            choices=("pending", "approved", "uncertain"),
-            default="pending",
         )
         parser.add_argument("--strict-records", action="store_true")
         parser.add_argument(
@@ -116,15 +112,16 @@ class Command(BaseCommand):
                     updated_at_field=options["updated_at_field"],
                     field_map=self._field_map(options["field_map"]),
                     delimiter=options["delimiter"],
-                    default_review_status=options["review_status"],
                     strict_records=options["strict_records"],
                     sync_now=not options["no_sync"],
                     integration=self._profile(options["profile"]),
+                    origin="management:import_source_file",
+                    system=True,
                 )
         except CommandError:
             raise
         except Exception as exc:
-            raise CommandError(str(exc)) from exc
+            raise CommandError(sanitized_connector_error(exc)) from exc
 
         inspection = result.inspection
         self.stdout.write(

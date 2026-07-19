@@ -1,6 +1,7 @@
 from django.core.management.base import BaseCommand
 
 from integrations.models import Integration
+from integrations.secrets import sanitized_connector_error
 from integrations.services import run_integration_sync
 
 
@@ -11,7 +12,11 @@ class Command(BaseCommand):
         failures = 0
         for integration in Integration.objects.filter(enabled=True):
             try:
-                run = run_integration_sync(integration)
+                run = run_integration_sync(
+                    integration,
+                    origin="management:sync_enabled_integrations",
+                    system=True,
+                )
                 self.stdout.write(
                     self.style.SUCCESS(
                         f"{integration.slug}: {run.status}; accepted={run.records_accepted}; "
@@ -20,6 +25,10 @@ class Command(BaseCommand):
                 )
             except Exception as exc:
                 failures += 1
-                self.stderr.write(self.style.ERROR(f"{integration.slug}: {exc}"))
+                self.stderr.write(
+                    self.style.ERROR(
+                        f"{integration.slug}: {sanitized_connector_error(exc)}"
+                    )
+                )
         if failures:
             self.stderr.write(self.style.WARNING(f"{failures} integration(s) failed"))

@@ -5,9 +5,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request
 
+from .http_response import ResponseTooLargeError, read_bounded_response
 from .outbound import UnsafeOutboundUrlError, open_outbound_request
 
 
@@ -20,6 +21,17 @@ class IntegrationHttpError(RuntimeError):
     def __str__(self) -> str:
         prefix = f"HTTP {self.status}" if self.status else "HTTP request failed"
         return f"{prefix}: {self.message} ({self.url})"
+
+
+def _safe_url(url: str) -> str:
+    parsed = urlsplit(url)
+    hostname = parsed.hostname or ""
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        parsed_port = None
+    port = f":{parsed_port}" if parsed_port else ""
+    return urlunsplit((parsed.scheme, f"{hostname}{port}", parsed.path, "", ""))
 
 
 def request_json(
@@ -45,29 +57,28 @@ def request_json(
     try:
         request = Request(url=url, data=body, method=method, headers=request_headers)
         with open_outbound_request(request, timeout=timeout) as response:
-            payload = response.read()
+            payload = read_bounded_response(response)
     except UnsafeOutboundUrlError as exc:
-        raise IntegrationHttpError(None, str(exc), url) from exc
+        raise IntegrationHttpError(None, str(exc), _safe_url(url)) from exc
     except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")[:2000]
-        try:
-            decoded = json.loads(raw)
-            message = (
-                decoded.get("error_description")
-                or decoded.get("error", {}).get("message")
-                or decoded.get("message")
-                or raw
-            )
-        except (json.JSONDecodeError, AttributeError):
-            message = raw or exc.reason
-        raise IntegrationHttpError(exc.code, str(message), url) from exc
+        raise IntegrationHttpError(
+            exc.code,
+            "Remote endpoint returned an error",
+            _safe_url(url),
+        ) from exc
     except URLError as exc:
-        raise IntegrationHttpError(None, str(exc.reason), url) from exc
+        raise IntegrationHttpError(
+            None,
+            f"Network failure ({type(exc.reason).__name__})",
+            _safe_url(url),
+        ) from exc
+    except ResponseTooLargeError as exc:
+        raise IntegrationHttpError(None, str(exc), _safe_url(url)) from exc
 
     try:
         decoded = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise IntegrationHttpError(None, "Response was not valid JSON", url) from exc
+        raise IntegrationHttpError(None, "Response was not valid JSON", _safe_url(url)) from exc
     if not isinstance(decoded, dict):
-        raise IntegrationHttpError(None, "Expected a JSON object response", url)
+        raise IntegrationHttpError(None, "Expected a JSON object response", _safe_url(url))
     return decoded

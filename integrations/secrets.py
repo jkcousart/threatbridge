@@ -4,6 +4,7 @@ import json
 import os
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 SENSITIVE_KEY_PARTS = (
     "authorization",
@@ -13,7 +14,36 @@ SENSITIVE_KEY_PARTS = (
     "api_key",
     "apikey",
     "client_secret",
+    "error",
+    "exception",
+    "headers",
+    "message",
+    "query",
+    "response_body",
 )
+
+CONFIGURATION_SECRET_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "client_secret",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "headers",
+        "password",
+        "secret",
+        "token",
+    }
+)
+CURSOR_SECRET_KEYS = CONFIGURATION_SECRET_KEYS | {
+    "access_token",
+    "auth",
+    "signature",
+    "sig",
+}
 
 
 def resolve_secret_reference(reference: str) -> Mapping[str, Any]:
@@ -83,8 +113,129 @@ def safe_excerpt(value: Any, *, max_text: int = 500, depth: int = 0) -> Any:
     return text if len(text) <= max_text else f"{text[:max_text]}...<truncated>"
 
 
-def redacted_result(value: Mapping[str, Any]) -> dict[str, Any]:
+def _configuration_key(value: Any) -> str:
+    return str(value).strip().casefold().replace("-", "_")
+
+
+def validate_non_secret_configuration(value: Any) -> None:
+    """Reject credentials embedded in ordinary connector configuration."""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if _configuration_key(key) in CONFIGURATION_SECRET_KEYS:
+                raise ValueError(
+                    "Integration credentials must use secret_reference, not configuration"
+                )
+            validate_non_secret_configuration(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            validate_non_secret_configuration(item)
+
+
+def redacted_configuration(value: Any) -> Any:
+    """Hide any legacy credential fields before rendering configuration."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): (
+                "<redacted>"
+                if _configuration_key(key) in CONFIGURATION_SECRET_KEYS
+                else redacted_configuration(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redacted_configuration(item) for item in value]
+    return value
+
+
+def _secret_strings(value: Any) -> set[str]:
+    if isinstance(value, Mapping):
+        result: set[str] = set()
+        for item in value.values():
+            result.update(_secret_strings(item))
+        return result
+    if isinstance(value, (list, tuple, set)):
+        result = set()
+        for item in value:
+            result.update(_secret_strings(item))
+        return result
+    text = str(value)
+    return {text} if len(text) >= 4 else set()
+
+
+def _contains_known_secret(value: Any, secret_values: set[str]) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            _contains_known_secret(item, secret_values) for item in value.values()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_known_secret(item, secret_values) for item in value)
+    text = str(value)
+    return any(secret in text for secret in secret_values)
+
+
+def validate_safe_cursor(
+    value: Any,
+    *,
+    resolved_secrets: Mapping[str, Any] | None = None,
+) -> None:
+    """Reject connector cursors that could persist credential material."""
+
+    if _contains_known_secret(value, _secret_strings(resolved_secrets or {})):
+        raise ValueError("Connector cursor contains sensitive material and cannot be stored")
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if _configuration_key(key) in CURSOR_SECRET_KEYS:
+                raise ValueError(
+                    "Connector cursor contains sensitive material and cannot be stored"
+                )
+            validate_safe_cursor(item)
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            validate_safe_cursor(item)
+        return
+    text = str(value)
+    if text.startswith(("http://", "https://")):
+        sensitive_query = any(
+            _configuration_key(key) in CURSOR_SECRET_KEYS
+            for key, _query_value in parse_qsl(urlsplit(text).query, keep_blank_values=True)
+        )
+        if sensitive_query:
+            raise ValueError(
+                "Connector cursor contains sensitive material and cannot be stored"
+            )
+
+
+def _redact_known_values(value: Any, secret_values: set[str]) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _redact_known_values(item, secret_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_known_values(item, secret_values) for item in value]
+    text = str(value)
+    for secret in secret_values:
+        if secret in text:
+            return "<redacted>"
+    return value
+
+
+def redacted_result(
+    value: Mapping[str, Any],
+    *,
+    resolved_secrets: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Redact connector diagnostics before storing or returning them."""
 
     result = safe_excerpt(value)
+    result = _redact_known_values(result, _secret_strings(resolved_secrets or {}))
     return dict(result) if isinstance(result, Mapping) else {"result": result}
+
+
+def sanitized_connector_error(exc: BaseException) -> str:
+    """Describe a connector failure without persisting vendor-controlled text."""
+
+    return f"{type(exc).__name__}: connector operation failed"

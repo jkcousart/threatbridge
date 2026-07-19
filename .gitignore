@@ -1,14 +1,3 @@
-__pycache__/
-*.py[cod]
-*.sqlite3
-.env
-.venv/
-.pytest_cache/
-.ruff_cache/
-staticfiles/
-data/incoming/*
-!data/incoming/.gitkeep
-
 # Secrets and local configuration
 .env
 .env.*
@@ -45,10 +34,20 @@ uploads/
 coverage.xml
 htmlcov/
 security-reports/
+docs/security/tmkb*
+docs/security/*audit-report*
+docs/security/*hardening-report*
+docs/security/private-*
 bandit-report.*
 pip-audit-report.*
 gitleaks-report.*
 *.log
+.codex-*
+
+# Generated static and local incoming data
+staticfiles/
+data/incoming/*
+!data/incoming/.gitkeep
 
 # IDE and operating system
 .vscode/

@@ -30,6 +30,7 @@ from catalog.models import (
     ValidationTest,
     Vulnerability,
     VulnerabilityFinding,
+    VulnerabilitySource,
 )
 from integrations.models import ExternalObject, Integration
 
@@ -533,7 +534,12 @@ def project_software_installation(source_object: ExternalObject) -> SoftwareInst
 
 
 def project_vulnerability(source_object: ExternalObject) -> Vulnerability:
-    return resolve_vulnerability(source_object.normalized)
+    vulnerability = resolve_vulnerability(source_object.normalized)
+    VulnerabilitySource.objects.get_or_create(
+        source_object=source_object,
+        vulnerability=vulnerability,
+    )
+    return vulnerability
 
 
 def project_vulnerability_finding(source_object: ExternalObject) -> VulnerabilityFinding:
@@ -541,6 +547,10 @@ def project_vulnerability_finding(source_object: ExternalObject) -> Vulnerabilit
     metadata = _mapping(normalized.get("metadata"))
     asset = resolve_asset(source_object.integration, normalized, source_object)
     vulnerability = resolve_vulnerability(normalized)
+    VulnerabilitySource.objects.get_or_create(
+        source_object=source_object,
+        vulnerability=vulnerability,
+    )
     product = resolve_product(normalized)
     raw_status = _clean(_first(normalized, "status", "finding_status", default="open"))
     raw_status = raw_status.lower().replace(" ", "_")
@@ -869,12 +879,6 @@ def project_threat_report(source_object: ExternalObject) -> ThreatReport:
         },
     )
 
-    default_review = _clean(
-        source_object.integration.configuration.get("default_review_status", "pending")
-    ).lower()
-    if default_review not in dict(ThreatReportTechnique.ReviewStatus.choices):
-        default_review = ThreatReportTechnique.ReviewStatus.PENDING
-
     ThreatReportTechnique.objects.filter(report=report).delete()
     for item in _list(
         _first(normalized, "techniques", "attack_techniques", default=[])
@@ -889,7 +893,6 @@ def project_threat_report(source_object: ExternalObject) -> ThreatReport:
             )
             name = _clean(item.get("name"))
             evidence_excerpt = _clean(_first(item, "evidence_excerpt", "evidence"))
-            review_status = _clean(item.get("review_status") or default_review).lower()
             try:
                 link_confidence = max(
                     0,
@@ -901,18 +904,15 @@ def project_threat_report(source_object: ExternalObject) -> ThreatReport:
             identifier = item
             name = ""
             evidence_excerpt = ""
-            review_status = default_review
             link_confidence = confidence
         technique_id = _technique_id(identifier)
         if not technique_id:
             continue
-        if review_status not in dict(ThreatReportTechnique.ReviewStatus.choices):
-            review_status = ThreatReportTechnique.ReviewStatus.PENDING
         ThreatReportTechnique.objects.create(
             report=report,
             technique=resolve_technique(technique_id, name),
             confidence=link_confidence,
-            review_status=review_status,
+            review_status=ThreatReportTechnique.ReviewStatus.PENDING,
             evidence_excerpt=evidence_excerpt,
         )
 
@@ -929,10 +929,15 @@ def project_threat_report(source_object: ExternalObject) -> ThreatReport:
             payload = {"cve_id": identifier}
         if not _cve(identifier):
             continue
+        vulnerability = resolve_vulnerability(payload)
         ThreatReportVulnerability.objects.create(
             report=report,
-            vulnerability=resolve_vulnerability(payload),
+            vulnerability=vulnerability,
             evidence_excerpt=evidence_excerpt,
+        )
+        VulnerabilitySource.objects.get_or_create(
+            source_object=source_object,
+            vulnerability=vulnerability,
         )
 
     Observable.objects.filter(report=report).delete()

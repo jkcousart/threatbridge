@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Replaced staff-based workflow authorization with centralized named permissions across browser,
+  REST, services, management origins, and Django admin; removed HTTP Basic Authentication while
+  retaining session CSRF protection.
+- Forced all imported and reprojected ATT&CK mappings to pending and added permissioned centralized
+  approval/rejection with append-only review history.
+- Added permissioned assessment execution with actor/origin and active-evidence provenance.
+- Added recoverable source-evidence deletion/restoration services, default-hidden deleted records,
+  projection/assessment exclusion, and connector non-resurrection behavior.
+- Added structured append-only security audit events with bounded recursive redaction.
+- Added bounded connector response reads, sanitized operator errors and metadata, non-rendered
+  secret references, credential-free configuration validation, safe cursor handling, and hostile-file
+  limits.
+- Added fail-closed production settings, generic readiness failures, and explicit proxy trust.
+- Added public governance and security documentation; license selection remains a publication
+  blocker.
 - Upgraded the development test dependency to a non-vulnerable pytest 9 release.
 - Replaced the static Django development key with a persistent, ignored, restrictively stored local secret while retaining production fail-closed behavior.
 - Prevented Docker builds from generating or retaining the local Django secret during `collectstatic`; builds now use a random command-scoped key and verify that `/app/.secrets` is absent.

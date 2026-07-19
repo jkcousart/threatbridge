@@ -8,6 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request
 
+from integrations.http_response import ResponseTooLargeError, read_bounded_response
 from integrations.outbound import UnsafeOutboundUrlError, open_outbound_request
 
 
@@ -43,26 +44,29 @@ def request_json(
         request = Request(url, data=body, headers=request_headers, method=method.upper())
         try:
             with open_outbound_request(request, timeout=timeout) as response:
-                payload = response.read().decode("utf-8")
+                payload = read_bounded_response(response).decode("utf-8")
                 decoded = json.loads(payload) if payload else {}
                 if not isinstance(decoded, Mapping):
                     raise HttpClientError("Expected a JSON object response")
                 return decoded
         except HTTPError as exc:
             last_error = exc
-            response_body = exc.read().decode("utf-8", errors="replace")[:1000]
             if exc.code not in {429, 500, 502, 503, 504} or attempt >= retries:
-                raise HttpClientError(
-                    f"HTTP {exc.code} from {url}: {response_body or exc.reason}"
-                ) from exc
+                raise HttpClientError(f"Remote endpoint returned HTTP {exc.code}") from exc
             retry_after = exc.headers.get("Retry-After")
             delay = float(retry_after) if retry_after and retry_after.isdigit() else 2**attempt
             time.sleep(min(delay, 10))
         except UnsafeOutboundUrlError as exc:
             raise HttpClientError(str(exc)) from exc
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except ResponseTooLargeError as exc:
+            raise HttpClientError(str(exc)) from exc
+        except (URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             last_error = exc
             if attempt >= retries:
-                raise HttpClientError(f"Request failed for {url}: {exc}") from exc
+                raise HttpClientError(
+                    f"Connector request failed ({type(exc).__name__})"
+                ) from exc
             time.sleep(min(2**attempt, 10))
-    raise HttpClientError(f"Request failed for {url}: {last_error}")
+    raise HttpClientError(
+        f"Connector request failed ({type(last_error).__name__})"
+    )

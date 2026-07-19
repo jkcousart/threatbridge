@@ -14,7 +14,11 @@ class SyncServiceTests(TestCase):
             adapter_path="integrations.adapters.demo.DemoAdapter",
         )
 
-        run = run_integration_sync(integration)
+        run = run_integration_sync(
+            integration,
+            origin="management:test_sync_service",
+            system=True,
+        )
 
         integration.refresh_from_db()
         expected_count = len(DemoAdapter.RECORDS)
@@ -28,6 +32,10 @@ class SyncServiceTests(TestCase):
             {"complete": True, "record_count": expected_count},
         )
 
-        second_run = run_integration_sync(integration)
+        second_run = run_integration_sync(
+            integration,
+            origin="management:test_sync_service",
+            system=True,
+        )
         self.assertEqual(ExternalObject.objects.count(), expected_count)
         self.assertEqual(second_run.records_unchanged, expected_count)

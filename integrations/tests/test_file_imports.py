@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 
-from catalog.models import Asset, ThreatReport, Vulnerability
+from catalog.models import Asset, SecurityAuditEvent, ThreatReport, Vulnerability
 from integrations.file_imports import create_file_import, inspect_uploaded_file
 from integrations.models import ExternalObject, Integration, SyncRun
 
@@ -44,7 +45,12 @@ class FileImportTests(TestCase):
             "hostname",
         )
 
-        result = create_file_import(uploaded_file=upload, object_type="auto")
+        result = create_file_import(
+            uploaded_file=upload,
+            object_type="auto",
+            origin="management:test_file_import",
+            system=True,
+        )
 
         self.assertEqual(result.run.status, SyncRun.Status.SUCCEEDED)
         self.assertEqual(result.run.records_accepted, 2)
@@ -63,7 +69,12 @@ class FileImportTests(TestCase):
             b"device_id,device_name,criticality\nasset-1,server-01.example,high\n",
             content_type="text/csv",
         )
-        first = create_file_import(uploaded_file=first_upload, object_type="auto")
+        first = create_file_import(
+            uploaded_file=first_upload,
+            object_type="auto",
+            origin="management:test_file_import",
+            system=True,
+        )
         second_upload = SimpleUploadedFile(
             "assets-two.csv",
             b"device_id,device_name,criticality\nasset-2,server-02.example,critical\n",
@@ -74,6 +85,8 @@ class FileImportTests(TestCase):
             uploaded_file=second_upload,
             object_type="auto",
             integration=first.integration,
+            origin="management:test_file_import",
+            system=True,
         )
 
         self.assertEqual(first.integration.pk, second.integration.pk)
@@ -111,7 +124,12 @@ class FileImportTests(TestCase):
         self.assertEqual(inspection.suggested_object_type, "threat_report")
         self.assertEqual(inspection.suggested_id_fields, ["report_id"])
 
-        result = create_file_import(uploaded_file=upload, object_type="auto")
+        result = create_file_import(
+            uploaded_file=upload,
+            object_type="auto",
+            origin="management:test_file_import",
+            system=True,
+        )
 
         self.assertEqual(result.run.status, SyncRun.Status.SUCCEEDED)
         self.assertEqual(result.run.records_projected, 1)
@@ -154,6 +172,8 @@ class FileImportTests(TestCase):
                 "device.platform": "os_platform",
                 "criticality": "criticality",
             },
+            origin="management:test_file_import",
+            system=True,
         )
 
         self.assertEqual(result.run.status, SyncRun.Status.SUCCEEDED)
@@ -191,7 +211,12 @@ class FileImportTests(TestCase):
         self.assertEqual(inspection.records_key, "data.results")
         self.assertEqual(inspection.suggested_object_type, "asset")
 
-        result = create_file_import(uploaded_file=upload, object_type="auto")
+        result = create_file_import(
+            uploaded_file=upload,
+            object_type="auto",
+            origin="management:test_file_import",
+            system=True,
+        )
         self.assertEqual(result.run.status, SyncRun.Status.SUCCEEDED)
         self.assertTrue(
             Asset.objects.filter(
@@ -229,7 +254,12 @@ class FileImportTests(TestCase):
             content_type="application/json",
         )
 
-        result = create_file_import(uploaded_file=upload, object_type="mixed")
+        result = create_file_import(
+            uploaded_file=upload,
+            object_type="mixed",
+            origin="management:test_file_import",
+            system=True,
+        )
 
         self.assertEqual(result.run.status, SyncRun.Status.SUCCEEDED)
         self.assertEqual(result.run.records_accepted, 2)
@@ -282,7 +312,12 @@ class FileImportTests(TestCase):
             },
         )
 
-        result = create_file_import(uploaded_file=upload, object_type="auto")
+        result = create_file_import(
+            uploaded_file=upload,
+            object_type="auto",
+            origin="management:test_file_import",
+            system=True,
+        )
 
         self.assertEqual(result.run.status, SyncRun.Status.SUCCEEDED)
         self.assertEqual(result.run.records_projected, 2)
@@ -329,7 +364,12 @@ class FileImportTests(TestCase):
             "os_platform",
         )
 
-        result = create_file_import(uploaded_file=upload, object_type="auto")
+        result = create_file_import(
+            uploaded_file=upload,
+            object_type="auto",
+            origin="management:test_file_import",
+            system=True,
+        )
 
         self.assertEqual(result.run.status, SyncRun.Status.SUCCEEDED)
         self.assertEqual(result.run.records_projected, 2)
@@ -339,10 +379,58 @@ class FileImportTests(TestCase):
             "critical",
         )
 
+    def test_strict_partial_failure_retains_evidence_run_audit_and_upload(self):
+        upload = SimpleUploadedFile(
+            "strict-partial-assets.csv",
+            (
+                b"device_id,device_name\n"
+                b"asset-persisted,retained.example.invalid\n"
+                b",invalid.example.invalid\n"
+            ),
+            content_type="text/csv",
+        )
+
+        with self.assertRaises(RuntimeError):
+            create_file_import(
+                uploaded_file=upload,
+                object_type="asset",
+                id_fields=["device_id"],
+                strict_records=True,
+                origin="management:test_strict_partial_failure",
+                system=True,
+            )
+
+        integration = Integration.objects.get()
+        run = integration.sync_runs.get()
+        stored_path = Path(self.temporary_directory.name) / integration.configuration["path"]
+        self.assertFalse(integration.enabled)
+        self.assertEqual(run.status, SyncRun.Status.FAILED)
+        self.assertEqual(run.records_accepted, 1)
+        self.assertEqual(
+            ExternalObject.all_objects.filter(integration=integration).count(),
+            1,
+        )
+        self.assertTrue(Asset.objects.filter(hostname="retained.example.invalid").exists())
+        self.assertTrue(stored_path.is_file())
+        self.assertEqual(
+            set(
+                SecurityAuditEvent.objects.filter(
+                    origin="management:test_strict_partial_failure"
+                ).values_list("event_type", flat=True)
+            ),
+            {
+                "file_import.started",
+                "file_import.completed",
+                "integration.sync_started",
+                "integration.sync_completed",
+            },
+        )
+
 
 class FileImportEndpointTests(TestCase):
     def setUp(self):
         from django.contrib.auth import get_user_model
+        from django.contrib.auth.models import Permission
 
         self.temporary_directory = TemporaryDirectory()
         self.override = override_settings(
@@ -355,6 +443,12 @@ class FileImportEndpointTests(TestCase):
             username="file-import-admin",
             password="test-password",
             is_staff=True,
+        )
+        self.user.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="integrations",
+                codename="import_source_file",
+            )
         )
         self.client.force_login(self.user)
 
@@ -431,6 +525,11 @@ class FileImportEndpointTests(TestCase):
         self.assertEqual(payload["sync_run"]["records_projected"], 1)
         self.assertEqual(Integration.objects.get().name, "Endpoint asset import")
         self.assertEqual(Asset.objects.count(), 1)
+        self.assertTrue(
+            {"file_import.started", "file_import.completed"}.issubset(
+                SecurityAuditEvent.objects.values_list("event_type", flat=True)
+            )
+        )
 
     def test_rest_json_upload_auto_maps_camel_case_fields(self):
         response = self.client.post(

@@ -3,6 +3,7 @@ from django.core.management.base import BaseCommand, CommandError
 from catalog.models import Assessment, ThreatReport
 from catalog.services.assess import generate_assessment
 from integrations.models import Integration
+from integrations.secrets import sanitized_connector_error
 from integrations.services import run_integration_sync
 
 
@@ -25,15 +26,18 @@ class Command(BaseCommand):
                 "adapter_path": "integrations.adapters.demo.DemoAdapter",
                 "enabled": True,
                 "configuration": {
-                    "default_review_status": "approved",
                     "project_records": True,
                 },
             },
         )
         try:
-            run = run_integration_sync(integration)
+            run = run_integration_sync(
+                integration,
+                origin="management:seed_demo",
+                system=True,
+            )
         except Exception as exc:
-            raise CommandError(str(exc)) from exc
+            raise CommandError(sanitized_connector_error(exc)) from exc
 
         self.stdout.write(
             self.style.SUCCESS(
@@ -54,7 +58,11 @@ class Command(BaseCommand):
         except ThreatReport.DoesNotExist as exc:
             raise CommandError("The demo threat report was not projected.") from exc
 
-        assessment = generate_assessment(report)
+        assessment = generate_assessment(
+            report,
+            origin="management:seed_demo",
+            system=True,
+        )
         if assessment.status != Assessment.Status.SUCCEEDED:
             raise CommandError(assessment.error_summary or "Demo assessment failed")
         self.stdout.write(

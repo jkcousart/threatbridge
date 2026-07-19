@@ -17,13 +17,23 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.text import slugify
 
+from catalog.services.audit import record_security_event
+from threatbridge.authorization import Permissions, require_operation_permission
+
+from .import_limits import (
+    configured_limit,
+    validate_csv_shape,
+    validate_json_value,
+    validate_uncompressed_content,
+    validate_upload_name,
+)
 from .import_schemas import (
     integration_kind_for_object_type,
     suggest_field_map,
     suggest_id_fields,
     suggest_object_type,
 )
-from .models import Integration, SyncRun
+from .models import ExternalObject, Integration, SyncRun
 from .services import run_integration_sync
 
 ALLOWED_FILE_FORMATS = {
@@ -97,6 +107,7 @@ def _max_import_records() -> int:
 
 
 def _format_from_name(name: str) -> str:
+    validate_upload_name(name)
     suffix = Path(name or "").suffix.lower()
     file_format = ALLOWED_FILE_FORMATS.get(suffix)
     if not file_format:
@@ -117,6 +128,7 @@ def _read_uploaded_bytes(uploaded_file: UploadedFile) -> bytes:
         raise ValueError(f"File is too large. Maximum upload size is {maximum:,} bytes.")
     if not content:
         raise ValueError("The uploaded file is empty.")
+    validate_uncompressed_content(content)
     return content
 
 
@@ -207,6 +219,7 @@ def _inspect_csv(
     requested_delimiter: str = "",
 ) -> tuple[list[str], list[dict[str, Any]], int, str]:
     delimiter = _detect_delimiter(text, requested_delimiter)
+    csv.field_size_limit(configured_limit("THREATBRIDGE_MAX_CSV_FIELD_LENGTH", 100_000))
     reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter)
     if not reader.fieldnames:
         raise ValueError("CSV upload does not contain a header row.")
@@ -216,6 +229,7 @@ def _inspect_csv(
     normalized = [field.casefold() for field in fields]
     if len(normalized) != len(set(normalized)):
         raise ValueError("CSV header contains duplicate column names.")
+    validate_csv_shape(fields)
 
     samples: list[dict[str, Any]] = []
     record_count = 0
@@ -226,7 +240,8 @@ def _inspect_csv(
         record_count += 1
         if record_count > maximum:
             raise ValueError(f"Import contains more than the {maximum:,}-record limit.")
-        if len(samples) < 5:
+        validate_csv_shape(fields, row)
+        if len(samples) < configured_limit("THREATBRIDGE_MAX_PREVIEW_SAMPLES", 5):
             samples.append({str(key): value for key, value in row.items()})
     if record_count == 0:
         raise ValueError("CSV upload contains no data rows.")
@@ -245,12 +260,23 @@ def _inspect_json(
         for line_number, line in enumerate(text.splitlines(), start=1):
             if not line.strip():
                 continue
+            maximum_line = configured_limit(
+                "THREATBRIDGE_MAX_JSONL_LINE_BYTES", 1024 * 1024
+            )
+            if len(line.encode("utf-8")) > maximum_line:
+                raise ValueError(
+                    f"JSON Lines record {line_number} exceeds the configured line limit"
+                )
             try:
                 value = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"JSON Lines record {line_number} is invalid: {exc.msg}.") from exc
+            except (json.JSONDecodeError, RecursionError) as exc:
+                message = getattr(exc, "msg", "nesting is too deep")
+                raise ValueError(
+                    f"JSON Lines record {line_number} is invalid: {message}."
+                ) from exc
             if not isinstance(value, Mapping):
                 raise ValueError(f"JSON Lines record {line_number} is not an object.")
+            validate_json_value(value)
             records.append(dict(value))
             if len(records) > maximum:
                 raise ValueError(f"Import contains more than the {maximum:,}-record limit.")
@@ -258,10 +284,13 @@ def _inspect_json(
     else:
         try:
             payload = json.loads(text)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
+            if isinstance(exc, RecursionError):
+                raise ValueError("JSON nesting exceeds the supported parser depth.") from exc
             raise ValueError(
                 f"JSON is invalid at line {exc.lineno}, column {exc.colno}: {exc.msg}."
             ) from exc
+        validate_json_value(payload)
         records, used_key = _resolve_json_records(payload, records_key)
         maximum = _max_import_records()
         if len(records) > maximum:
@@ -273,7 +302,8 @@ def _inspect_json(
     for record in records[:500]:
         field_set.update(_json_field_paths(record))
     fields = sorted(field_set, key=lambda value: value.casefold())
-    return fields, records[:5], len(records), used_key
+    sample_limit = configured_limit("THREATBRIDGE_MAX_PREVIEW_SAMPLES", 5)
+    return fields, records[:sample_limit], len(records), used_key
 
 
 def _json_field_paths(
@@ -315,14 +345,41 @@ def inspect_uploaded_file(
     object_type: str = "auto",
 ) -> FileInspection:
     file_format = _format_from_name(uploaded_file.name)
+    content_type = str(uploaded_file.content_type or "application/octet-stream").lower()
+    accepted_types = {
+        "csv": {
+            "application/csv",
+            "application/octet-stream",
+            "application/vnd.ms-excel",
+            "text/csv",
+            "text/plain",
+        },
+        "json": {
+            "application/json",
+            "application/octet-stream",
+            "text/json",
+            "text/plain",
+        },
+        "jsonl": {
+            "application/json",
+            "application/octet-stream",
+            "application/x-ndjson",
+            "text/plain",
+        },
+    }
+    if content_type.split(";", 1)[0].strip() not in accepted_types[file_format]:
+        raise ValueError("Upload content type conflicts with its selected file format")
     content = _read_uploaded_bytes(uploaded_file)
     text, encoding = _decode_text(content, file_format=file_format)
 
     if file_format == "csv":
-        fields, samples, record_count, detected_delimiter = _inspect_csv(
-            text,
-            requested_delimiter=delimiter,
-        )
+        try:
+            fields, samples, record_count, detected_delimiter = _inspect_csv(
+                text,
+                requested_delimiter=delimiter,
+            )
+        except csv.Error as exc:
+            raise ValueError("CSV field exceeds the configured field-length limit") from exc
         used_key = ""
     else:
         fields, samples, record_count, used_key = _inspect_json(
@@ -332,17 +389,24 @@ def inspect_uploaded_file(
         )
         detected_delimiter = ""
 
-    suggested_type = (
-        suggest_object_type(fields, samples[0] if samples else None)
-        if object_type in {"", "auto"}
-        else object_type
-    )
+    detected_type = suggest_object_type(fields, samples[0] if samples else None)
+    suggested_type = detected_type if object_type in {"", "auto"} else object_type
+    if object_type not in {"", "auto", "mixed"} and detected_type != object_type:
+        raise ValueError(
+            f"Detected {detected_type} structure conflicts with selected {object_type} import type"
+        )
+    if object_type == "mixed":
+        if file_format == "csv" or any(
+            not {"external_id", "object_type", "normalized"}.issubset(sample)
+            for sample in samples
+        ):
+            raise ValueError("Mixed imports require ThreatBridge JSON envelope records")
     if file_format == "csv" and suggested_type == "mixed":
         suggested_type = "asset"
     return FileInspection(
         original_name=Path(uploaded_file.name).name,
         file_format=file_format,
-        content_type=str(uploaded_file.content_type or "application/octet-stream"),
+        content_type=content_type,
         size_bytes=len(content),
         sha256=hashlib.sha256(content).hexdigest(),
         encoding=encoding,
@@ -429,7 +493,37 @@ def _clean_id_fields(value: Iterable[str] | str | None) -> list[str]:
     return result
 
 
-def create_file_import(
+def _handle_failed_import_sync(
+    *,
+    integration: Integration,
+    stored: StoredUpload,
+    created_integration: bool,
+    previous_state: Mapping[str, Any] | None,
+) -> None:
+    remove_upload = False
+    with transaction.atomic():
+        locked = Integration.objects.select_for_update().get(pk=integration.pk)
+        evidence_persisted = ExternalObject.all_objects.filter(
+            integration_id=locked.pk
+        ).exists()
+        if created_integration:
+            if evidence_persisted:
+                locked.enabled = False
+                locked.save(update_fields=["enabled", "updated_at"])
+            else:
+                locked.delete()
+                remove_upload = True
+        elif previous_state is not None:
+            for field_name, value in previous_state.items():
+                setattr(locked, field_name, value)
+            locked.save()
+            remove_upload = True
+
+    if remove_upload:
+        stored.absolute_path.unlink(missing_ok=True)
+
+
+def _create_file_import(
     *,
     uploaded_file: UploadedFile,
     name: str = "",
@@ -440,11 +534,27 @@ def create_file_import(
     updated_at_field: str = "",
     field_map: Mapping[str, str] | None = None,
     delimiter: str = "",
-    default_review_status: str = "pending",
     strict_records: bool = False,
     sync_now: bool = True,
     integration: Integration | None = None,
+    actor=None,
+    origin: str,
+    system: bool = False,
 ) -> FileImportResult:
+    created_integration = integration is None
+    previous_state = None
+    if integration is not None:
+        previous_state = {
+            "name": integration.name,
+            "slug": integration.slug,
+            "kind": integration.kind,
+            "adapter_path": integration.adapter_path,
+            "enabled": integration.enabled,
+            "configuration": dict(integration.configuration),
+            "cursor": dict(integration.cursor),
+            "health": integration.health,
+            "last_error": integration.last_error,
+        }
     existing_configuration = dict(integration.configuration) if integration else {}
     if integration:
         if object_type in {"", "auto"}:
@@ -468,10 +578,6 @@ def create_file_import(
             field_map = stored_map if isinstance(stored_map, Mapping) else {}
         if not delimiter:
             delimiter = str(existing_configuration.get("delimiter", ""))
-        if default_review_status == "pending":
-            default_review_status = str(
-                existing_configuration.get("default_review_status", default_review_status)
-            )
         strict_records = bool(strict_records or existing_configuration.get("strict_records", False))
         name = name or integration.name
 
@@ -522,7 +628,6 @@ def create_file_import(
         "field_map": resolved_map,
         "natural_key_field": natural_key_field.strip(),
         "updated_at_field": updated_at_field.strip(),
-        "default_review_status": default_review_status,
         "upload": {
             "original_name": inspection.original_name,
             "sha256": stored.sha256,
@@ -579,10 +684,91 @@ def create_file_import(
         stored.absolute_path.unlink(missing_ok=True)
         raise
 
-    run = run_integration_sync(integration) if sync_now else None
-    return FileImportResult(
+    try:
+        run = (
+            run_integration_sync(
+                integration,
+                actor=actor,
+                origin=origin,
+                system=system,
+                operation_permission=Permissions.IMPORT_SOURCE_FILES,
+            )
+            if sync_now
+            else None
+        )
+    except Exception:
+        _handle_failed_import_sync(
+            integration=integration,
+            stored=stored,
+            created_integration=created_integration,
+            previous_state=previous_state,
+        )
+        raise
+    result = FileImportResult(
         integration=integration,
         run=run,
         inspection=inspection,
         stored_upload=stored,
     )
+    record_security_event(
+        event_type="file_import.completed",
+        origin=origin,
+        outcome="succeeded",
+        actor=actor,
+        target_type="integration",
+        target_identifier=integration.pk,
+        metadata={
+            "format": inspection.file_format,
+            "size_bytes": inspection.size_bytes,
+            "record_count": inspection.record_count,
+            "synchronized": bool(run),
+        },
+    )
+    return result
+
+
+def create_file_import(
+    *,
+    actor=None,
+    origin: str,
+    system: bool = False,
+    **kwargs,
+) -> FileImportResult:
+    require_operation_permission(
+        actor,
+        Permissions.IMPORT_SOURCE_FILES,
+        origin=origin,
+        system=system,
+    )
+    if kwargs.get("integration") is not None:
+        require_operation_permission(
+            actor,
+            Permissions.CONFIGURE_INTEGRATIONS,
+            origin=origin,
+            system=system,
+        )
+    record_security_event(
+        event_type="file_import.started",
+        origin=origin,
+        outcome="started",
+        actor=actor,
+        target_type="file_import",
+        metadata={"selected_object_type": kwargs.get("object_type", "auto")},
+    )
+    try:
+        return _create_file_import(
+            actor=actor,
+            origin=origin,
+            system=system,
+            **kwargs,
+        )
+    except Exception as exc:
+        record_security_event(
+            event_type="file_import.completed",
+            origin=origin,
+            outcome="failed",
+            actor=actor,
+            target_type="file_import",
+            metadata={"error_type": type(exc).__name__},
+        )
+        raise

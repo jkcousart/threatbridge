@@ -72,15 +72,6 @@ class FileImportForm(forms.Form):
             }
         ),
     )
-    default_review_status = forms.ChoiceField(
-        choices=(
-            ("pending", "Pending analyst review"),
-            ("approved", "Approved on import"),
-            ("uncertain", "Uncertain"),
-        ),
-        initial="pending",
-        help_text="Applied to ATT&CK mappings embedded in imported threat reports.",
-    )
     strict_records = forms.BooleanField(
         required=False,
         help_text="Stop the entire synchronization when any record is invalid.",
@@ -91,11 +82,12 @@ class FileImportForm(forms.Form):
         help_text="Immediately normalize and project records after upload.",
     )
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, allow_existing_profiles: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["integration"].queryset = Integration.objects.filter(
-            adapter_path__in=FILE_ADAPTER_PATHS
-        ).order_by("name")
+        if allow_existing_profiles:
+            self.fields["integration"].queryset = Integration.objects.filter(
+                adapter_path__in=FILE_ADAPTER_PATHS
+            ).order_by("name")
 
     def clean_file(self):
         uploaded_file = self.cleaned_data["file"]

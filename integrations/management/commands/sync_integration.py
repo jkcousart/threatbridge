@@ -1,6 +1,7 @@
 from django.core.management.base import BaseCommand, CommandError
 
 from integrations.models import Integration
+from integrations.secrets import sanitized_connector_error
 from integrations.services import run_integration_sync
 
 
@@ -13,11 +14,15 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         try:
             integration = Integration.objects.get(slug=options["slug"])
-            run = run_integration_sync(integration)
+            run = run_integration_sync(
+                integration,
+                origin="management:sync_integration",
+                system=True,
+            )
         except Integration.DoesNotExist as exc:
             raise CommandError(f"Unknown integration: {options['slug']}") from exc
         except Exception as exc:
-            raise CommandError(str(exc)) from exc
+            raise CommandError(sanitized_connector_error(exc)) from exc
 
         self.stdout.write(
             self.style.SUCCESS(

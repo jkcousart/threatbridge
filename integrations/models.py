@@ -1,4 +1,13 @@
+from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
+
+
+class ActiveExternalObjectManager(models.Manager):
+    use_in_migrations = True
+
+    def get_queryset(self):
+        return super().get_queryset().filter(is_deleted=False)
 
 
 class Integration(models.Model):
@@ -42,9 +51,24 @@ class Integration(models.Model):
 
     class Meta:
         ordering = ["name"]
+        permissions = [
+            ("configure_integration", "Can configure integrations"),
+            ("test_integration", "Can test integrations"),
+            ("synchronize_integration", "Can synchronize integrations"),
+            ("import_source_file", "Can import local source files"),
+        ]
 
     def __str__(self) -> str:
         return self.name
+
+    def clean(self):
+        super().clean()
+        from .secrets import validate_non_secret_configuration
+
+        try:
+            validate_non_secret_configuration(self.configuration)
+        except ValueError as exc:
+            raise ValidationError({"configuration": str(exc)}) from exc
 
 
 class SyncRun(models.Model):
@@ -55,6 +79,14 @@ class SyncRun(models.Model):
         FAILED = "failed", "Failed"
 
     integration = models.ForeignKey(Integration, on_delete=models.CASCADE, related_name="sync_runs")
+    initiated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="threatbridge_sync_runs",
+        null=True,
+        blank=True,
+    )
+    origin = models.CharField(max_length=255, default="unknown")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.RUNNING)
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
@@ -98,6 +130,26 @@ class ExternalObject(models.Model):
     first_seen_at = models.DateTimeField(auto_now_add=True)
     last_seen_at = models.DateTimeField(auto_now=True)
     is_deleted = models.BooleanField(default=False)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="threatbridge_deleted_evidence",
+        null=True,
+        blank=True,
+    )
+    deletion_reason = models.TextField(blank=True)
+    deletion_origin = models.CharField(max_length=255, blank=True)
+    restored_at = models.DateTimeField(null=True, blank=True)
+    restored_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="threatbridge_restored_evidence",
+        null=True,
+        blank=True,
+    )
+    restoration_reason = models.TextField(blank=True)
+    restoration_origin = models.CharField(max_length=255, blank=True)
     projection_status = models.CharField(
         max_length=16,
         choices=ProjectionStatus.choices,
@@ -106,7 +158,21 @@ class ExternalObject(models.Model):
     projection_error = models.TextField(blank=True)
     projected_at = models.DateTimeField(null=True, blank=True)
 
+    objects = ActiveExternalObjectManager()
+    all_objects = models.Manager()
+
     class Meta:
+        base_manager_name = "all_objects"
+        default_manager_name = "objects"
+        permissions = [
+            (
+                "view_restricted_source_evidence",
+                "Can view restricted source evidence",
+            ),
+            ("view_deleted_source_evidence", "Can view deleted source evidence"),
+            ("delete_source_evidence", "Can delete source evidence"),
+            ("restore_deleted_source_evidence", "Can restore deleted source evidence"),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["integration", "object_type", "external_id"],

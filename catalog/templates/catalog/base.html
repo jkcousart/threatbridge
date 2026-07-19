@@ -21,9 +21,9 @@
       <nav class="nav" aria-label="Primary navigation">
         <a href="{% url 'dashboard' %}">Dashboard</a>
         <a href="{% url 'web-threat-report-list' %}">Threat reports</a>
-        <a href="{% url 'web-integration-list' %}">Integrations</a>
-        {% if user.is_staff %}<a href="{% url 'web-file-import-new' %}">Import data</a>{% endif %}
-        <a href="{% url 'web-source-evidence-list' %}">Evidence</a>
+        {% if perms.integrations.view_integration %}<a href="{% url 'web-integration-list' %}">Integrations</a>{% endif %}
+        {% if perms.integrations.import_source_file %}<a href="{% url 'web-file-import-new' %}">Import data</a>{% endif %}
+        {% if perms.integrations.view_restricted_source_evidence %}<a href="{% url 'web-source-evidence-list' %}">Evidence</a>{% endif %}
         {% if user.is_staff %}<a href="{% url 'admin:index' %}">Admin</a>{% endif %}
       </nav>
       <div class="account">

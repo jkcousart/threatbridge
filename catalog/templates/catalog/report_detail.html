@@ -9,7 +9,7 @@
     <p>{{ report.summary|default:"No summary was supplied by the source." }}</p>
     <div class="metadata-line"><span>{{ report.confidence }}% confidence</span>{% if report.published_at %}<span>Published {{ report.published_at|date:"M j, Y H:i" }}</span>{% endif %}<span>Source evidence #{{ report.source_object_id }}</span></div>
   </div>
-  <form method="post" action="{% url 'web-assess-report' report.pk %}">{% csrf_token %}<button class="button button-primary" type="submit">Generate assessment</button></form>
+  {% if perms.catalog.run_assessment %}<form method="post" action="{% url 'web-assess-report' report.pk %}">{% csrf_token %}<button class="button button-primary" type="submit">Generate assessment</button></form>{% endif %}
 </section>
 
 <div class="two-column wide-left">
@@ -23,14 +23,15 @@
             <p>{{ link.evidence_excerpt|default:"No source excerpt was supplied." }}</p>
             <small>{{ link.confidence }}% mapping confidence · {{ link.technique.detection_rules.count }} mapped detection{{ link.technique.detection_rules.count|pluralize }}</small>
           </div>
-          <form class="review-form" method="post" action="{% url 'web-review-technique' link.pk %}">
+          {% if perms.catalog.review_attack_mapping %}<form class="review-form" method="post" action="{% url 'web-review-technique' link.pk %}">
             {% csrf_token %}
             <label for="review-{{ link.pk }}">Analyst decision</label>
             <select id="review-{{ link.pk }}" name="review_status">
               {% for value,label in review_choices %}<option value="{{ value }}" {% if value == link.review_status %}selected{% endif %}>{{ label }}</option>{% endfor %}
             </select>
+            <input type="text" name="reason" maxlength="4000" placeholder="Analyst note" required>
             <button class="button button-small button-secondary" type="submit">Save</button>
-          </form>
+          </form>{% endif %}
         </article>
       {% empty %}<div class="empty-state">No ATT&amp;CK mappings were supplied.</div>{% endfor %}
     </div>
@@ -52,7 +53,7 @@
       </div>
     </section>
     <section class="panel">
-      <div class="panel-heading"><h2>Assessment history</h2><span>{{ report.assessments.count }}</span></div>
+      <div class="panel-heading"><h2>Assessment history</h2><span>{{ assessment_count }}</span></div>
       <div class="item-list compact-list">
         {% for assessment in assessments %}<a class="item-row" href="{% url 'web-assessment-detail' assessment.pk %}"><span><strong>{{ assessment.started_at|date:"M j, Y H:i" }}</strong><small>{{ assessment.summary.finding_count|default:0 }} findings</small></span><span class="badge badge-{{ assessment.status }}">{{ assessment.get_status_display }}</span></a>{% empty %}<div class="empty-state">No assessment has been run.</div>{% endfor %}
       </div>

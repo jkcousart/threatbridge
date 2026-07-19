@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 
 
@@ -151,6 +152,27 @@ class Vulnerability(TimestampedModel):
 
     def __str__(self) -> str:
         return self.cve_id
+
+
+class VulnerabilitySource(TimestampedModel):
+    source_object = models.ForeignKey(
+        "integrations.ExternalObject",
+        on_delete=models.CASCADE,
+        related_name="vulnerability_projections",
+    )
+    vulnerability = models.ForeignKey(
+        Vulnerability,
+        on_delete=models.CASCADE,
+        related_name="sources",
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source_object", "vulnerability"],
+                name="catalog_unique_vulnerability_source",
+            )
+        ]
 
 
 class VulnerabilityFinding(TimestampedModel):
@@ -460,6 +482,9 @@ class ThreatReportTechnique(TimestampedModel):
     evidence_excerpt = models.TextField(blank=True)
 
     class Meta:
+        permissions = [
+            ("review_attack_mapping", "Can approve or reject ATT&CK mappings"),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["report", "technique"],
@@ -527,11 +552,21 @@ class Assessment(TimestampedModel):
         null=True,
         blank=True,
     )
+    origin = models.CharField(max_length=255, default="unknown")
+    evidence_sources = models.ManyToManyField(
+        "integrations.ExternalObject",
+        related_name="assessments",
+        blank=True,
+    )
+    evidence_provenance_complete = models.BooleanField(default=False)
     summary = models.JSONField(default=dict, blank=True)
     error_summary = models.TextField(blank=True)
 
     class Meta:
         ordering = ["-started_at"]
+        permissions = [
+            ("run_assessment", "Can run or recalculate assessments"),
+        ]
 
 
 class GapFinding(TimestampedModel):
@@ -590,5 +625,72 @@ class GapFinding(TimestampedModel):
             models.Index(fields=["assessment", "category"]),
         ]
 
+
+class AppendOnlyModel(models.Model):
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Append-only records cannot be modified.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Append-only records cannot be deleted.")
+
+
+class AttackMappingReviewEvent(AppendOnlyModel):
+    mapping = models.ForeignKey(
+        ThreatReportTechnique,
+        on_delete=models.SET_NULL,
+        related_name="review_events",
+        null=True,
+        blank=True,
+    )
+    mapping_identifier = models.CharField(max_length=64)
+    previous_state = models.CharField(max_length=16, choices=ThreatReportTechnique.ReviewStatus)
+    new_state = models.CharField(max_length=16, choices=ThreatReportTechnique.ReviewStatus)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="threatbridge_mapping_reviews",
+        null=True,
+        blank=True,
+    )
+    actor_label = models.CharField(max_length=255, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    reason = models.TextField(blank=True)
+    origin = models.CharField(max_length=255)
+
+    class Meta:
+        ordering = ["-timestamp", "-id"]
+
+
+class SecurityAuditEvent(AppendOnlyModel):
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="threatbridge_security_events",
+        null=True,
+        blank=True,
+    )
+    actor_label = models.CharField(max_length=255, blank=True)
+    origin = models.CharField(max_length=255)
+    event_type = models.CharField(max_length=100)
+    target_type = models.CharField(max_length=100, blank=True)
+    target_identifier = models.CharField(max_length=255, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    outcome = models.CharField(max_length=32)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-timestamp", "-id"]
+        permissions = [
+            (
+                "administer_security_configuration",
+                "Can administer ThreatBridge security configuration",
+            ),
+        ]
+
     def __str__(self) -> str:
-        return self.title
+        return f"{self.event_type}: {self.outcome}"

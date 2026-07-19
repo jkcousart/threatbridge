@@ -13,9 +13,9 @@ def readyz(_request):
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1")
             cursor.fetchone()
-    except Exception as exc:
+    except Exception:
         return JsonResponse(
-            {"status": "not_ready", "service": "threatbridge", "error": str(exc)},
+            {"status": "not_ready", "service": "threatbridge"},
             status=503,
         )
     return JsonResponse({"status": "ready", "service": "threatbridge"})

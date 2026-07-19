@@ -5,6 +5,7 @@ from .views import (
     AssetViewSet,
     AttackTechniqueViewSet,
     DetectionRuleViewSet,
+    SecurityAuditEventViewSet,
     SoftwareInstallationViewSet,
     SoftwareProductViewSet,
     TelemetrySourceViewSet,
@@ -42,5 +43,10 @@ router.register(
     basename="threat-report-technique",
 )
 router.register("assessments", AssessmentViewSet, basename="assessment")
+router.register(
+    "security-audit-events",
+    SecurityAuditEventViewSet,
+    basename="security-audit-event",
+)
 
 urlpatterns = router.urls

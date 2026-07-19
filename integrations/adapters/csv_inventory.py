@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from django.conf import settings
+
+from integrations.import_limits import (
+    configured_limit,
+    read_bounded_path,
+    validate_csv_shape,
+)
 
 from .base import IntegrationAdapter, PullBatch, SourceRecord, SyncContext
 from .datetime_utils import parse_source_datetime
@@ -91,20 +98,20 @@ class CsvInventoryAdapter(IntegrationAdapter):
             "size": path.stat().st_size if path.is_file() else 0,
         }
         if path.is_file():
-            with path.open(
-                "r",
-                encoding=self._encoding(context),
-                newline="",
-            ) as handle:
-                reader = csv.reader(handle, delimiter=self._delimiter(context))
-                result["fields"] = next(reader, [])
+            content = read_bounded_path(path)
+            text = content.decode(self._encoding(context))
+            reader = csv.reader(io.StringIO(text, newline=""), delimiter=self._delimiter(context))
+            fields = next(reader, [])
+            validate_csv_shape(fields)
+            result["fields"] = fields
         return result
 
     def pull(self, context: SyncContext, cursor: Mapping[str, Any]) -> PullBatch:
         path = self._resolve_path(context)
         if not path.is_file():
             raise FileNotFoundError(path)
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        content = read_bounded_path(path)
+        digest = hashlib.sha256(content).hexdigest()
         if bool(context.configuration.get("skip_unchanged", True)) and cursor.get(
             "file_sha256"
         ) == digest:
@@ -122,20 +129,24 @@ class CsvInventoryAdapter(IntegrationAdapter):
             )
         )
         records: list[Mapping[str, Any]] = []
-        with path.open(
-            "r",
-            encoding=self._encoding(context),
-            newline="",
-        ) as handle:
-            reader = csv.DictReader(handle, delimiter=self._delimiter(context))
-            if not reader.fieldnames:
-                raise ValueError("CSV file does not contain a header row")
-            for row in reader:
-                if row is None or not any(value not in (None, "") for value in row.values()):
-                    continue
-                records.append(dict(row))
-                if len(records) > maximum:
-                    raise ValueError(f"CSV contains more than the {maximum:,}-record limit")
+        csv.field_size_limit(
+            configured_limit("THREATBRIDGE_MAX_CSV_FIELD_LENGTH", 100_000)
+        )
+        text = content.decode(self._encoding(context))
+        reader = csv.DictReader(
+            io.StringIO(text, newline=""),
+            delimiter=self._delimiter(context),
+        )
+        if not reader.fieldnames:
+            raise ValueError("CSV file does not contain a header row")
+        validate_csv_shape(reader.fieldnames)
+        for row in reader:
+            if row is None or not any(value not in (None, "") for value in row.values()):
+                continue
+            validate_csv_shape(reader.fieldnames, row)
+            records.append(dict(row))
+            if len(records) > maximum:
+                raise ValueError(f"CSV contains more than the {maximum:,}-record limit")
         return PullBatch(
             records=records,
             next_cursor={"file_sha256": digest, "complete": True},

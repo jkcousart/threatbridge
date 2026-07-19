@@ -1,16 +1,25 @@
 # ThreatBridge integration setup
 
-ThreatBridge integrations are read-only by default. Every connector writes the original vendor record to `ExternalObject` before projecting it into the canonical catalog. Credentials are referenced through environment variables and are never stored in the `Integration.configuration` JSON.
+ThreatBridge integrations are read-only by default. Every connector stores the latest source record
+it supplied in `ExternalObject` before projecting normalized values into the canonical catalog.
+Credentials are referenced through environment variables and are never stored in the
+`Integration.configuration` JSON.
 
 ## Create an integration
 
 Sign in through `/accounts/login/`, open `/integrations/`, and select **Add API integration**
-to create an integration with the authenticated Django Admin browser session.
+to create an integration with an authenticated Django Admin browser session. Staff status permits
+admin entry only; integration viewing and configuration require `integrations.view_integration` and
+`integrations.configure_integration` respectively.
 
 Test and synchronize a configured integration:
 
 1. Sign in and open `/integrations/`.
 2. Use **Test** or **Sync** beside the configured integration.
+
+Testing requires `integrations.test_integration`; synchronization requires
+`integrations.synchronize_integration`. File imports use the independent
+`integrations.import_source_file` permission.
 
 The current release does not provide a production-ready authentication method for unattended
 REST API automation. Do not put account passwords in command lines; use the authenticated browser
@@ -70,13 +79,9 @@ Use a second profile and change `resource` to `software_inventory`:
 }
 ```
 
-Set the credential variables in the ThreatBridge process environment:
-
-```bash
-DEFENDER_TENANT_ID=00000000-0000-0000-0000-000000000000
-DEFENDER_CLIENT_ID=00000000-0000-0000-0000-000000000000
-DEFENDER_CLIENT_SECRET=replace-with-secret-provider-value
-```
+Have the deployment's secret provider inject `DEFENDER_TENANT_ID`, `DEFENDER_CLIENT_ID`, and
+`DEFENDER_CLIENT_SECRET` into the ThreatBridge process. Do not type or store their values in shell
+commands, checked-in files, or integration configuration.
 
 The Entra application should receive only the read permissions required for the selected feeds. The current adapter uses the paged `SoftwareInventoryByMachine` and `SoftwareVulnerabilitiesByMachine` endpoints. For very large estates, add a bulk-export adapter before production rollout rather than raising page guardrails indefinitely.
 
@@ -90,20 +95,24 @@ The Entra application should receive only the read permissions required for the 
   "adapter_path": "integrations.adapters.opencti.OpenCtiReportsAdapter",
   "enabled": true,
   "configuration": {
-    "base_url": "https://opencti.example.org",
+    "base_url": "https://opencti.example.invalid",
     "page_size": 100,
-    "default_review_status": "pending",
     "project_records": true
   },
   "secret_reference": "env://OPENCTI"
 }
 ```
 
-```bash
-OPENCTI_TOKEN=replace-with-read-only-api-token
-```
+Have the deployment's secret provider inject `OPENCTI_TOKEN` into the ThreatBridge process. Do not
+place the token in source files, shell history, process arguments, or integration configuration.
 
-The built-in GraphQL query imports reports, markings, linked ATT&CK patterns, and linked CVEs. OpenCTI schemas can differ by release and extensions; set `configuration.query` to a tenant-tested GraphQL query when an instance does not accept the default selection set.
+The built-in GraphQL query imports reports, markings, linked ATT&CK patterns, and linked CVEs.
+OpenCTI schemas can differ by release and extensions; set `configuration.query` to a
+deployment-tested GraphQL query when an instance does not accept the default selection set.
+
+All imported ATT&CK report mappings begin pending regardless of connector payload or configuration.
+Approval and rejection require `catalog.review_attack_mapping` and create append-only review and
+security events.
 
 ## MITRE ATT&CK STIX
 
@@ -207,12 +216,18 @@ python manage.py import_source_file new-export.csv \
 
 Add `--no-sync` to save the profile and source file without immediately importing it. Add `--strict-records` when one invalid record should fail the whole synchronization instead of being isolated as a record error.
 
+Uploads and subsequent file reads enforce configured byte, record, nesting, object-field,
+field-name, scalar, CSV-column/field, JSONL-line, preview, and retained-error limits. Archive or
+compressed content, null bytes, traversal filenames, malformed encodings, and format/structure
+conflicts are rejected. Malware scanning and quarantine are deployment requirements and are not
+implemented here.
+
 ## Outbound network allow-list
 
 Production deployments must set `THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS` to the exact API hosts used by configured connectors:
 
 ```bash
-THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=api.security.microsoft.com,login.microsoftonline.com,opencti.example.org
+THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=api.security.microsoft.com,login.microsoftonline.com,opencti.example.invalid
 ```
 
 Plain HTTP connector URLs are rejected when `DJANGO_DEBUG=false`.
@@ -233,6 +248,10 @@ destinations even when a broad CIDR is configured. DNS is revalidated immediatel
 connection and on every same-origin redirect; redirects to another host, scheme, or port are
 rejected.
 
+Connector response bodies are limited by `THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES` before full
+loading. Operator-facing errors retain bounded status/type information but omit response bodies,
+request headers, query-string secrets, credentials, and resolved secret values.
+
 ## Secret references
 
 Two environment-backed formats are supported:
@@ -241,11 +260,8 @@ Two environment-backed formats are supported:
 env:VARIABLE
 ```
 
-The variable may contain a JSON object, for example:
-
-```bash
-THREATBRIDGE_OPENCTI_SECRET='{"token":"replace-me"}'
-```
+The variable may contain a JSON object. For example, the secret provider can inject an object with
+a `token` key. Its value must not be entered in a command line or committed configuration.
 
 ```text
 env://PREFIX

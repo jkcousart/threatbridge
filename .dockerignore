@@ -45,6 +45,7 @@ security-reports
 docs/security/tmkb*
 docs/security/*audit-report*
 docs/security/*hardening-report*
+docs/security/hardening-phase-1-report.md
 docs/security/private-*
 
 # Archives and logs

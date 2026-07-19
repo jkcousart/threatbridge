@@ -66,6 +66,10 @@ Required behavior:
 - Connector-specific failures do not corrupt the previous successful cursor.
 - Temporary network failures and throttling are handled inside the adapter or HTTP client.
 - A connector never writes secret values to logs, sync metadata, source records, or exceptions.
+- Response bodies are read with the centralized configured byte limit rather than unbounded
+  `read()` calls.
+- Deleted source keys remain deleted when they reappear during synchronization; only the explicit
+  restoration service can reactivate them.
 - Vendor write-back requires a separate, explicit design and permission boundary.
 
 ## PullBatch behavior
@@ -168,6 +172,10 @@ JSON source paths can use dotted traversal. JSON Lines uses one object per non-e
 ```
 
 Envelope mode supports multiple normalized object types in one JSON or JSON Lines file. The whole envelope is retained as the raw source record.
+
+Imported threat-report ATT&CK mappings are always created pending. Adapters and payloads cannot set
+approved, rejected, or uncertain review state. An authorized analyst must use the centralized
+review transition service.
 
 ## Adding a connector
 

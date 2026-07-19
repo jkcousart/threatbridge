@@ -1,0 +1,7 @@
+# Publication blocker: replace these placeholders with verified repository teams before publishing.
+* @threatbridge-maintainers
+/threatbridge/ @threatbridge-security-reviewers
+/integrations/ @threatbridge-security-reviewers
+/catalog/ @threatbridge-security-reviewers
+/docs/security-architecture.md @threatbridge-security-reviewers
+/docs/deployment-hardening.md @threatbridge-security-reviewers

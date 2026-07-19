@@ -9,6 +9,12 @@ from typing import Any
 
 from django.conf import settings
 
+from integrations.import_limits import (
+    configured_limit,
+    read_bounded_path,
+    validate_json_value,
+)
+
 from .base import IntegrationAdapter, PullBatch, SourceRecord, SyncContext
 from .datetime_utils import parse_source_datetime
 
@@ -153,7 +159,8 @@ class JsonFileAdapter(IntegrationAdapter):
         path = self._path(context)
         if not path.is_file():
             raise FileNotFoundError(path)
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        content = read_bounded_path(path)
+        digest = hashlib.sha256(content).hexdigest()
         if (
             bool(context.configuration.get("skip_unchanged", True))
             and cursor.get("file_sha256") == digest
@@ -170,12 +177,19 @@ class JsonFileAdapter(IntegrationAdapter):
             or ("jsonl" if path.suffix.lower() in {".jsonl", ".ndjson"} else "json")
         ).lower()
         encoding = str(context.configuration.get("encoding", "utf-8-sig")) or "utf-8-sig"
-        text = path.read_text(encoding=encoding)
+        text = content.decode(encoding)
         if file_format == "jsonl":
             records: list[Mapping[str, Any]] = []
             for line_number, line in enumerate(text.splitlines(), start=1):
                 if not line.strip():
                     continue
+                maximum_line = configured_limit(
+                    "THREATBRIDGE_MAX_JSONL_LINE_BYTES", 1024 * 1024
+                )
+                if len(line.encode("utf-8")) > maximum_line:
+                    raise ValueError(
+                        f"JSON Lines record {line_number} exceeds the configured line limit"
+                    )
                 try:
                     value = json.loads(line)
                 except json.JSONDecodeError as exc:
@@ -184,9 +198,11 @@ class JsonFileAdapter(IntegrationAdapter):
                     ) from exc
                 if not isinstance(value, Mapping):
                     raise ValueError(f"JSON Lines record {line_number} is not an object")
+                validate_json_value(value)
                 records.append(dict(value))
         else:
             payload = json.loads(text)
+            validate_json_value(payload)
             records = self._resolve_records(
                 payload,
                 str(context.configuration.get("records_key", "")).strip(),

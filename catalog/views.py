@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import uuid
 
-from django.db.models import Count, Q
+from django.db.models import Count, IntegerField, OuterRef, Prefetch, Q, Subquery, Value
+from django.db.models.functions import Coalesce
 from django.utils import timezone
-from rest_framework import mixins, status, viewsets
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -12,21 +13,26 @@ from rest_framework.response import Response
 from integrations.adapters.base import SourceRecord
 from integrations.models import Integration
 from integrations.services import ingest_source_record
+from threatbridge.authorization import HasNamedPermission, Permissions
 
 from .models import (
     Assessment,
     Asset,
-    AttackTechnique,
-    DetectionRule,
+    SecurityAuditEvent,
     SoftwareInstallation,
     SoftwareProduct,
-    TelemetrySource,
     ThreatReport,
     ThreatReportTechnique,
-    ValidationResult,
-    ValidationTest,
     Vulnerability,
     VulnerabilityFinding,
+)
+from .provenance import (
+    active_assessments,
+    active_attack_techniques,
+    active_detection_rules,
+    active_telemetry_sources,
+    active_validation_results,
+    active_validation_tests,
 )
 from .serializers import (
     AssessmentSerializer,
@@ -34,6 +40,7 @@ from .serializers import (
     AttackTechniqueSerializer,
     DetectionRuleSerializer,
     ManualThreatReportSerializer,
+    SecurityAuditEventSerializer,
     SoftwareInstallationSerializer,
     SoftwareProductSerializer,
     TelemetrySourceSerializer,
@@ -45,6 +52,7 @@ from .serializers import (
     VulnerabilitySerializer,
 )
 from .services.assess import generate_assessment
+from .services.review import transition_attack_mapping_review
 
 
 class AssetViewSet(viewsets.ReadOnlyModelViewSet):
@@ -52,11 +60,20 @@ class AssetViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = Asset.objects.annotate(
-            software_count=Count("software_installations", distinct=True),
+        queryset = Asset.objects.filter(
+            sources__source_object__is_deleted=False
+        ).distinct().annotate(
+            software_count=Count(
+                "software_installations",
+                filter=Q(software_installations__source_object__is_deleted=False),
+                distinct=True,
+            ),
             open_vulnerability_count=Count(
                 "vulnerability_findings",
-                filter=Q(vulnerability_findings__status="open"),
+                filter=Q(
+                    vulnerability_findings__status="open",
+                    vulnerability_findings__source_object__is_deleted=False,
+                ),
                 distinct=True,
             ),
         )
@@ -71,11 +88,14 @@ class AssetViewSet(viewsets.ReadOnlyModelViewSet):
             )
         if criticality:
             queryset = queryset.filter(criticality=criticality)
-        return queryset
+        return queryset.order_by("id")
 
 
 class SoftwareProductViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = SoftwareProduct.objects.all()
+    queryset = SoftwareProduct.objects.filter(
+        Q(installations__source_object__is_deleted=False)
+        | Q(vulnerability_findings__source_object__is_deleted=False)
+    ).distinct()
     serializer_class = SoftwareProductSerializer
     permission_classes = [IsAuthenticated]
 
@@ -85,7 +105,9 @@ class SoftwareInstallationViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = SoftwareInstallation.objects.select_related(
+        queryset = SoftwareInstallation.objects.filter(
+            source_object__is_deleted=False
+        ).select_related(
             "asset",
             "product",
             "source_object__integration",
@@ -96,7 +118,7 @@ class SoftwareInstallationViewSet(viewsets.ReadOnlyModelViewSet):
             queryset = queryset.filter(asset_id=asset_id)
         if product_id:
             queryset = queryset.filter(product_id=product_id)
-        return queryset
+        return queryset.order_by("id")
 
 
 class VulnerabilityViewSet(viewsets.ReadOnlyModelViewSet):
@@ -104,10 +126,15 @@ class VulnerabilityViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = Vulnerability.objects.annotate(
+        queryset = Vulnerability.objects.filter(
+            sources__source_object__is_deleted=False
+        ).distinct().annotate(
             open_finding_count=Count(
                 "findings",
-                filter=Q(findings__status="open"),
+                filter=Q(
+                    findings__status="open",
+                    findings__source_object__is_deleted=False,
+                ),
                 distinct=True,
             )
         )
@@ -125,7 +152,9 @@ class VulnerabilityFindingViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = VulnerabilityFinding.objects.select_related(
+        queryset = VulnerabilityFinding.objects.filter(
+            source_object__is_deleted=False
+        ).select_related(
             "asset",
             "vulnerability",
             "product",
@@ -148,10 +177,13 @@ class AttackTechniqueViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = AttackTechnique.objects.annotate(
+        queryset = active_attack_techniques().annotate(
             detection_count=Count(
                 "detection_rules",
-                filter=Q(detection_rules__enabled=True),
+                filter=Q(
+                    detection_rules__enabled=True,
+                    detection_rules__source_object__is_deleted=False,
+                ),
                 distinct=True,
             )
         )
@@ -162,7 +194,7 @@ class AttackTechniqueViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class TelemetrySourceViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = TelemetrySource.objects.select_related("integration")
+    queryset = active_telemetry_sources().select_related("integration")
     serializer_class = TelemetrySourceSerializer
     permission_classes = [IsAuthenticated]
 
@@ -172,9 +204,19 @@ class DetectionRuleViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = DetectionRule.objects.select_related("integration").prefetch_related(
-            "techniques",
-            "telemetry_sources",
+        queryset = active_detection_rules().select_related(
+            "integration"
+        ).prefetch_related(
+            Prefetch(
+                "techniques",
+                queryset=active_attack_techniques(),
+                to_attr="active_techniques",
+            ),
+            Prefetch(
+                "telemetry_sources",
+                queryset=active_telemetry_sources(),
+                to_attr="active_telemetry_sources",
+            ),
         )
         technique_id = self.request.query_params.get("technique_id")
         enabled = self.request.query_params.get("enabled")
@@ -186,13 +228,19 @@ class DetectionRuleViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class ValidationTestViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = ValidationTest.objects.select_related("integration").prefetch_related("techniques")
+    queryset = active_validation_tests().select_related("integration").prefetch_related(
+        Prefetch(
+            "techniques",
+            queryset=active_attack_techniques(),
+            to_attr="active_techniques",
+        )
+    )
     serializer_class = ValidationTestSerializer
     permission_classes = [IsAuthenticated]
 
 
 class ValidationResultViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = ValidationResult.objects.select_related(
+    queryset = active_validation_results().select_related(
         "test",
         "technique",
         "detection_rule",
@@ -205,15 +253,38 @@ class ThreatReportViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ThreatReportSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_permissions(self):
+        if self.action in {"assess", "manual"}:
+            return [HasNamedPermission()]
+        return super().get_permissions()
+
+    def get_required_permission(self):
+        return {
+            "assess": Permissions.RUN_ASSESSMENTS,
+            "manual": Permissions.IMPORT_SOURCE_FILES,
+        }.get(self.action)
+
     def get_queryset(self):
+        active_assessment_counts = (
+            active_assessments(Assessment.objects.filter(report_id=OuterRef("pk")))
+            .values("report_id")
+            .annotate(total=Count("pk"))
+            .values("total")
+        )
         queryset = (
-            ThreatReport.objects.select_related("integration")
+            ThreatReport.objects.filter(source_object__is_deleted=False)
+            .select_related("integration")
             .prefetch_related(
                 "technique_links__technique",
                 "vulnerability_links__vulnerability",
                 "observables",
             )
-            .annotate(assessment_count=Count("assessments", distinct=True))
+            .annotate(
+                assessment_count=Coalesce(
+                    Subquery(active_assessment_counts, output_field=IntegerField()),
+                    Value(0),
+                )
+            )
         )
         integration = self.request.query_params.get("integration")
         search = self.request.query_params.get("search")
@@ -225,12 +296,16 @@ class ThreatReportViewSet(viewsets.ReadOnlyModelViewSet):
                 | Q(summary__icontains=search)
                 | Q(source_name__icontains=search)
             )
-        return queryset
+        return queryset.order_by("id")
 
     @action(detail=True, methods=["post"])
     def assess(self, request, pk=None):
         report = self.get_object()
-        assessment = generate_assessment(report, created_by=request.user)
+        assessment = generate_assessment(
+            report,
+            actor=request.user,
+            origin="rest:assessment",
+        )
         return Response(
             AssessmentSerializer(assessment).data,
             status=status.HTTP_201_CREATED,
@@ -246,7 +321,7 @@ class ThreatReportViewSet(viewsets.ReadOnlyModelViewSet):
                 "name": "Manual threat reports",
                 "kind": Integration.Kind.THREAT_INTELLIGENCE,
                 "adapter_path": "integrations.adapters.manual.ManualEntryAdapter",
-                "configuration": {"default_review_status": "pending"},
+                "configuration": {},
             },
         )
         payload = dict(serializer.validated_data)
@@ -266,6 +341,8 @@ class ThreatReportViewSet(viewsets.ReadOnlyModelViewSet):
             integration,
             record,
             project=True,
+            actor=request.user,
+            origin="rest:manual_threat_report",
         )
         return Response(
             ThreatReportSerializer(projected).data,
@@ -273,15 +350,45 @@ class ThreatReportViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
 
-class ThreatReportTechniqueViewSet(
-    mixins.RetrieveModelMixin,
-    mixins.UpdateModelMixin,
-    viewsets.GenericViewSet,
-):
-    queryset = ThreatReportTechnique.objects.select_related("report", "technique")
+class ThreatReportTechniqueViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = ThreatReportTechnique.objects.filter(
+        report__source_object__is_deleted=False
+    ).select_related("report", "technique")
     serializer_class = ThreatReportTechniqueSerializer
     permission_classes = [IsAuthenticated]
-    http_method_names = ["get", "patch", "head", "options"]
+
+    def get_permissions(self):
+        if self.action in {"approve", "reject"}:
+            return [HasNamedPermission()]
+        return super().get_permissions()
+
+    def get_required_permission(self):
+        return Permissions.REVIEW_ATTACK_MAPPINGS
+
+    def _review(self, request, state):
+        mapping = self.get_object()
+        try:
+            reviewed = transition_attack_mapping_review(
+                mapping,
+                new_state=state,
+                actor=request.user,
+                reason=request.data.get("reason", ""),
+                origin=f"rest:attack_mapping_{state}",
+            )
+        except ValueError as exc:
+            return Response(
+                {"reason": [str(exc)]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(self.get_serializer(reviewed).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        return self._review(request, ThreatReportTechnique.ReviewStatus.APPROVED)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        return self._review(request, ThreatReportTechnique.ReviewStatus.REJECTED)
 
 
 class AssessmentViewSet(viewsets.ReadOnlyModelViewSet):
@@ -289,7 +396,9 @@ class AssessmentViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = Assessment.objects.select_related("report", "created_by").prefetch_related(
+        queryset = active_assessments().select_related(
+            "report", "created_by"
+        ).prefetch_related(
             "findings__technique",
             "findings__vulnerability",
         )
@@ -297,3 +406,12 @@ class AssessmentViewSet(viewsets.ReadOnlyModelViewSet):
         if report_id:
             queryset = queryset.filter(report_id=report_id)
         return queryset
+
+
+class SecurityAuditEventViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = SecurityAuditEvent.objects.select_related("actor")
+    serializer_class = SecurityAuditEventSerializer
+    permission_classes = [HasNamedPermission]
+
+    def get_required_permission(self):
+        return Permissions.VIEW_SECURITY_AUDIT_EVENTS

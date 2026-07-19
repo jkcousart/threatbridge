@@ -4,16 +4,19 @@ from collections import Counter
 
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth.decorators import login_required, user_passes_test
-from django.db.models import Count, Q
-from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
+from django.contrib.auth.decorators import login_required
+from django.db.models import Count, IntegerField, OuterRef, Prefetch, Q, Subquery, Value
+from django.db.models.functions import Coalesce
+from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
 from integrations.file_imports import create_file_import, inspect_uploaded_file
 from integrations.forms import FILE_ADAPTER_PATHS, FileImportForm
 from integrations.models import ExternalObject, Integration, SyncRun
+from integrations.secrets import sanitized_connector_error
 from integrations.services import run_integration_sync, test_integration
+from threatbridge.authorization import Permissions, is_allowed, policy_required
 
 from .models import (
     Assessment,
@@ -24,7 +27,9 @@ from .models import (
     ThreatReportTechnique,
     VulnerabilityFinding,
 )
+from .provenance import active_assessments, active_detection_rules
 from .services.assess import generate_assessment
+from .services.review import REVIEW_DECISIONS, transition_attack_mapping_review
 
 PRIORITY_RANK = {
     GapFinding.Priority.CRITICAL: 0,
@@ -33,10 +38,6 @@ PRIORITY_RANK = {
     GapFinding.Priority.LOW: 3,
     GapFinding.Priority.INFO: 4,
 }
-
-
-def _staff_required(view):
-    return user_passes_test(lambda user: user.is_active and user.is_staff)(view)
 
 
 def _profile_initial(integration: Integration) -> dict:
@@ -56,17 +57,20 @@ def _profile_initial(integration: Integration) -> dict:
         "updated_at_field": configuration.get("updated_at_field", ""),
         "delimiter": configuration.get("delimiter", ""),
         "field_map": configuration.get("field_map", {}),
-        "default_review_status": configuration.get("default_review_status", "pending"),
         "strict_records": configuration.get("strict_records", False),
         "sync_now": True,
     }
 
 
-@_staff_required
+@policy_required(Permissions.IMPORT_SOURCE_FILES)
 def file_import_new(request: HttpRequest) -> HttpResponse:
+    can_manage_profiles = is_allowed(
+        request.user,
+        Permissions.VIEW_INTEGRATIONS,
+    ) and is_allowed(request.user, Permissions.CONFIGURE_INTEGRATIONS)
     initial: dict = {"object_type": "auto", "sync_now": True}
     profile_id = request.GET.get("profile")
-    if profile_id:
+    if profile_id and can_manage_profiles:
         profile = Integration.objects.filter(
             pk=profile_id,
             adapter_path__in=FILE_ADAPTER_PATHS,
@@ -75,7 +79,11 @@ def file_import_new(request: HttpRequest) -> HttpResponse:
             initial.update(_profile_initial(profile))
 
     if request.method == "POST":
-        form = FileImportForm(request.POST, request.FILES)
+        form = FileImportForm(
+            request.POST,
+            request.FILES,
+            allow_existing_profiles=can_manage_profiles,
+        )
         if form.is_valid():
             data = form.cleaned_data
             try:
@@ -89,13 +97,14 @@ def file_import_new(request: HttpRequest) -> HttpResponse:
                     updated_at_field=data.get("updated_at_field", ""),
                     field_map=data.get("field_map", {}),
                     delimiter=data.get("delimiter", ""),
-                    default_review_status=data.get("default_review_status", "pending"),
                     strict_records=data.get("strict_records", False),
                     sync_now=data.get("sync_now", True),
                     integration=data.get("integration"),
+                    actor=request.user,
+                    origin="browser:file_import",
                 )
             except Exception as exc:
-                form.add_error(None, str(exc))
+                form.add_error(None, sanitized_connector_error(exc))
             else:
                 run = result.run
                 if run:
@@ -112,16 +121,25 @@ def file_import_new(request: HttpRequest) -> HttpResponse:
                         request,
                         f"{result.integration.name}: upload saved and ready to synchronize.",
                     )
-                return redirect("web-integration-list")
+                return redirect(
+                    "web-integration-list" if can_manage_profiles else "dashboard"
+                )
     else:
-        form = FileImportForm(initial=initial)
+        form = FileImportForm(
+            initial=initial,
+            allow_existing_profiles=can_manage_profiles,
+        )
 
-    profiles = [
-        {"id": integration.pk, **_profile_initial(integration)}
-        for integration in Integration.objects.filter(
-            adapter_path__in=FILE_ADAPTER_PATHS
-        ).order_by("name")
-    ]
+    profiles = (
+        [
+            {"id": integration.pk, **_profile_initial(integration)}
+            for integration in Integration.objects.filter(
+                adapter_path__in=FILE_ADAPTER_PATHS
+            ).order_by("name")
+        ]
+        if can_manage_profiles
+        else []
+    )
     return render(
         request,
         "catalog/import_file.html",
@@ -139,7 +157,7 @@ def file_import_new(request: HttpRequest) -> HttpResponse:
 
 
 @require_POST
-@_staff_required
+@policy_required(Permissions.IMPORT_SOURCE_FILES)
 def file_import_preview(request: HttpRequest) -> JsonResponse:
     uploaded_file = request.FILES.get("file")
     if uploaded_file is None:
@@ -151,15 +169,20 @@ def file_import_preview(request: HttpRequest) -> JsonResponse:
             delimiter=request.POST.get("delimiter", ""),
             object_type=request.POST.get("object_type", "auto"),
         )
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         return JsonResponse({"error": str(exc)}, status=400)
+    except Exception:
+        return JsonResponse({"error": "The file could not be inspected."}, status=400)
     return JsonResponse(inspection.as_dict())
 
 
 @login_required
 def dashboard(request: HttpRequest) -> HttpResponse:
+    can_view_integrations = is_allowed(request.user, Permissions.VIEW_INTEGRATIONS)
     latest_assessment = (
-        Assessment.objects.filter(status=Assessment.Status.SUCCEEDED)
+        active_assessments(
+            Assessment.objects.filter(status=Assessment.Status.SUCCEEDED)
+        )
         .select_related("report")
         .first()
     )
@@ -172,19 +195,37 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         state_counts.update(latest_assessment.findings.values_list("state", flat=True))
 
     context = {
-        "asset_count": Asset.objects.count(),
-        "open_vulnerability_count": VulnerabilityFinding.objects.filter(status="open").count(),
-        "enabled_detection_count": DetectionRule.objects.filter(enabled=True).count(),
-        "report_count": ThreatReport.objects.count(),
-        "integration_count": Integration.objects.count(),
-        "unhealthy_integration_count": Integration.objects.exclude(
-            health=Integration.Health.HEALTHY
+        "asset_count": Asset.objects.filter(
+            sources__source_object__is_deleted=False
+        ).distinct().count(),
+        "open_vulnerability_count": VulnerabilityFinding.objects.filter(
+            status="open",
+            source_object__is_deleted=False,
         ).count(),
+        "enabled_detection_count": DetectionRule.objects.filter(
+            enabled=True,
+            source_object__is_deleted=False,
+        ).count(),
+        "report_count": ThreatReport.objects.filter(source_object__is_deleted=False).count(),
+        "integration_count": Integration.objects.count() if can_view_integrations else 0,
+        "unhealthy_integration_count": (
+            Integration.objects.exclude(health=Integration.Health.HEALTHY).count()
+            if can_view_integrations
+            else 0
+        ),
         "pending_review_count": ThreatReportTechnique.objects.filter(
-            review_status=ThreatReportTechnique.ReviewStatus.PENDING
+            review_status=ThreatReportTechnique.ReviewStatus.PENDING,
+            report__source_object__is_deleted=False,
         ).count(),
-        "latest_reports": ThreatReport.objects.select_related("integration")[:6],
-        "latest_runs": SyncRun.objects.select_related("integration")[:6],
+        "latest_reports": ThreatReport.objects.filter(
+            source_object__is_deleted=False
+        ).select_related("integration")[:6],
+        "latest_runs": (
+            SyncRun.objects.select_related("integration")[:6]
+            if can_view_integrations
+            else []
+        ),
+        "can_view_integrations": can_view_integrations,
         "latest_assessment": latest_assessment,
         "priority_counts": priority_counts,
         "state_counts": state_counts,
@@ -192,10 +233,14 @@ def dashboard(request: HttpRequest) -> HttpResponse:
     return render(request, "catalog/dashboard.html", context)
 
 
-@login_required
+@policy_required(Permissions.VIEW_INTEGRATIONS)
 def integration_list(request: HttpRequest) -> HttpResponse:
     integrations = Integration.objects.annotate(
-        object_count=Count("external_objects", distinct=True),
+        object_count=Count(
+            "external_objects",
+            filter=Q(external_objects__is_deleted=False),
+            distinct=True,
+        ),
         run_count=Count("sync_runs", distinct=True),
     ).prefetch_related("sync_runs")
     return render(
@@ -206,26 +251,36 @@ def integration_list(request: HttpRequest) -> HttpResponse:
 
 
 @require_POST
-@_staff_required
+@policy_required(Permissions.VIEW_INTEGRATIONS)
+@policy_required(Permissions.TEST_INTEGRATIONS)
 def integration_test(request: HttpRequest, pk: int) -> HttpResponse:
     integration = get_object_or_404(Integration, pk=pk)
     try:
-        result = test_integration(integration)
+        result = test_integration(
+            integration,
+            actor=request.user,
+            origin="browser:integration_test",
+        )
         if result.get("ok", True):
             messages.success(request, f"{integration.name}: connection test succeeded.")
         else:
             messages.warning(request, f"{integration.name}: connection test was degraded.")
     except Exception as exc:
-        messages.error(request, f"{integration.name}: {exc}")
+        messages.error(request, f"{integration.name}: {sanitized_connector_error(exc)}")
     return redirect("web-integration-list")
 
 
 @require_POST
-@_staff_required
+@policy_required(Permissions.VIEW_INTEGRATIONS)
+@policy_required(Permissions.SYNCHRONIZE_INTEGRATIONS)
 def integration_sync(request: HttpRequest, pk: int) -> HttpResponse:
     integration = get_object_or_404(Integration, pk=pk)
     try:
-        run = run_integration_sync(integration)
+        run = run_integration_sync(
+            integration,
+            actor=request.user,
+            origin="browser:integration_sync",
+        )
         messages.success(
             request,
             (
@@ -234,13 +289,18 @@ def integration_sync(request: HttpRequest, pk: int) -> HttpResponse:
             ),
         )
     except Exception as exc:
-        messages.error(request, f"{integration.name}: {exc}")
+        messages.error(request, f"{integration.name}: {sanitized_connector_error(exc)}")
     return redirect("web-integration-list")
 
 
-@login_required
+@policy_required(Permissions.VIEW_RESTRICTED_SOURCE_EVIDENCE)
 def source_evidence_list(request: HttpRequest) -> HttpResponse:
-    objects = ExternalObject.objects.select_related("integration")
+    include_deleted = request.GET.get("include_deleted") == "true" and is_allowed(
+        request.user,
+        Permissions.VIEW_DELETED_SOURCE_EVIDENCE,
+    )
+    manager = ExternalObject.all_objects if include_deleted else ExternalObject.objects
+    objects = manager.select_related("integration")
     integration = request.GET.get("integration", "")
     object_type = request.GET.get("object_type", "")
     projection_status = request.GET.get("projection_status", "")
@@ -264,7 +324,7 @@ def source_evidence_list(request: HttpRequest) -> HttpResponse:
         {
             "objects": objects,
             "integrations": Integration.objects.all(),
-            "object_types": ExternalObject.objects.order_by()
+            "object_types": manager.order_by()
             .values_list("object_type", flat=True)
             .distinct(),
             "projection_choices": ExternalObject.ProjectionStatus.choices,
@@ -273,6 +333,7 @@ def source_evidence_list(request: HttpRequest) -> HttpResponse:
                 "object_type": object_type,
                 "projection_status": projection_status,
                 "q": query,
+                "include_deleted": include_deleted,
             },
         },
     )
@@ -280,12 +341,22 @@ def source_evidence_list(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def threat_report_list(request: HttpRequest) -> HttpResponse:
+    active_assessment_counts = (
+        active_assessments(Assessment.objects.filter(report_id=OuterRef("pk")))
+        .values("report_id")
+        .annotate(total=Count("pk"))
+        .values("total")
+    )
     reports = (
-        ThreatReport.objects.select_related("integration")
+        ThreatReport.objects.filter(source_object__is_deleted=False)
+        .select_related("integration")
         .annotate(
             technique_count=Count("technique_links", distinct=True),
             vulnerability_count=Count("vulnerability_links", distinct=True),
-            assessment_count=Count("assessments", distinct=True),
+            assessment_count=Coalesce(
+                Subquery(active_assessment_counts, output_field=IntegerField()),
+                Value(0),
+            ),
             pending_count=Count(
                 "technique_links",
                 filter=Q(
@@ -312,38 +383,58 @@ def threat_report_list(request: HttpRequest) -> HttpResponse:
 @login_required
 def threat_report_detail(request: HttpRequest, pk: int) -> HttpResponse:
     report = get_object_or_404(
-        ThreatReport.objects.select_related("integration").prefetch_related(
-            "technique_links__technique__detection_rules",
+        ThreatReport.objects.filter(source_object__is_deleted=False)
+        .select_related("integration")
+        .prefetch_related(
+            Prefetch(
+                "technique_links__technique__detection_rules",
+                queryset=active_detection_rules(),
+            ),
             "vulnerability_links__vulnerability",
             "observables",
         ),
         pk=pk,
     )
-    assessments = report.assessments.all()[:10]
+    report_assessments = active_assessments(report.assessments.all())
+    assessment_count = report_assessments.count()
+    assessments = report_assessments[:10]
     return render(
         request,
         "catalog/report_detail.html",
         {
             "report": report,
             "assessments": assessments,
-            "review_choices": ThreatReportTechnique.ReviewStatus.choices,
+            "assessment_count": assessment_count,
+            "review_choices": [
+                choice
+                for choice in ThreatReportTechnique.ReviewStatus.choices
+                if choice[0] in REVIEW_DECISIONS
+            ],
         },
     )
 
 
 @require_POST
-@login_required
+@policy_required(Permissions.REVIEW_ATTACK_MAPPINGS)
 def review_technique(request: HttpRequest, pk: int) -> HttpResponse:
     link = get_object_or_404(
-        ThreatReportTechnique.objects.select_related("report", "technique"),
+        ThreatReportTechnique.objects.filter(
+            report__source_object__is_deleted=False
+        ).select_related("report", "technique"),
         pk=pk,
     )
     status_value = request.POST.get("review_status", "")
-    valid_values = {choice for choice, _label in ThreatReportTechnique.ReviewStatus.choices}
-    if status_value not in valid_values:
-        raise Http404("Unknown review status")
-    link.review_status = status_value
-    link.save(update_fields=["review_status", "updated_at"])
+    try:
+        link = transition_attack_mapping_review(
+            link,
+            new_state=status_value,
+            actor=request.user,
+            reason=request.POST.get("reason", ""),
+            origin="browser:attack_mapping_review",
+        )
+    except ValueError as exc:
+        messages.error(request, str(exc))
+        return redirect("web-threat-report-detail", pk=link.report_id)
     messages.success(
         request,
         f"{link.technique.technique_id} marked {link.get_review_status_display().lower()}.",
@@ -352,25 +443,34 @@ def review_technique(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 @require_POST
-@login_required
+@policy_required(Permissions.RUN_ASSESSMENTS)
 def assess_report(request: HttpRequest, pk: int) -> HttpResponse:
-    report = get_object_or_404(ThreatReport, pk=pk)
+    report = get_object_or_404(
+        ThreatReport.objects.filter(source_object__is_deleted=False),
+        pk=pk,
+    )
     try:
-        assessment = generate_assessment(report, created_by=request.user)
+        assessment = generate_assessment(
+            report,
+            actor=request.user,
+            origin="browser:assessment",
+        )
         messages.success(
             request,
             f"Assessment completed with {assessment.summary.get('finding_count', 0)} findings.",
         )
         return redirect("web-assessment-detail", pk=assessment.pk)
     except Exception as exc:
-        messages.error(request, f"Assessment failed: {exc}")
+        messages.error(request, f"Assessment failed: {type(exc).__name__}")
         return redirect("web-threat-report-detail", pk=report.pk)
 
 
 @login_required
 def assessment_detail(request: HttpRequest, pk) -> HttpResponse:
     assessment = get_object_or_404(
-        Assessment.objects.select_related("report", "created_by").prefetch_related(
+        active_assessments()
+        .select_related("report", "created_by")
+        .prefetch_related(
             "findings__technique",
             "findings__vulnerability",
         ),

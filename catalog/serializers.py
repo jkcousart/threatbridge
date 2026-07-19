@@ -9,6 +9,7 @@ from .models import (
     DetectionRule,
     GapFinding,
     Observable,
+    SecurityAuditEvent,
     SoftwareInstallation,
     SoftwareProduct,
     TelemetrySource,
@@ -20,6 +21,7 @@ from .models import (
     Vulnerability,
     VulnerabilityFinding,
 )
+from .provenance import active_attack_techniques, active_telemetry_sources
 
 
 class AssetSerializer(serializers.ModelSerializer):
@@ -183,8 +185,8 @@ class TelemetrySourceSerializer(serializers.ModelSerializer):
 
 class DetectionRuleSerializer(serializers.ModelSerializer):
     integration_slug = serializers.CharField(source="integration.slug", read_only=True)
-    techniques = AttackTechniqueSerializer(many=True, read_only=True)
-    telemetry_sources = TelemetrySourceSerializer(many=True, read_only=True)
+    techniques = serializers.SerializerMethodField()
+    telemetry_sources = serializers.SerializerMethodField()
 
     class Meta:
         model = DetectionRule
@@ -206,9 +208,21 @@ class DetectionRuleSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def get_techniques(self, obj: DetectionRule):
+        techniques = getattr(obj, "active_techniques", None)
+        if techniques is None:
+            techniques = active_attack_techniques(obj.techniques.all())
+        return AttackTechniqueSerializer(techniques, many=True).data
+
+    def get_telemetry_sources(self, obj: DetectionRule):
+        sources = getattr(obj, "active_telemetry_sources", None)
+        if sources is None:
+            sources = active_telemetry_sources(obj.telemetry_sources.all())
+        return TelemetrySourceSerializer(sources, many=True).data
+
 
 class ValidationTestSerializer(serializers.ModelSerializer):
-    techniques = AttackTechniqueSerializer(many=True, read_only=True)
+    techniques = serializers.SerializerMethodField()
     integration_slug = serializers.CharField(source="integration.slug", read_only=True)
 
     class Meta:
@@ -226,6 +240,12 @@ class ValidationTestSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_techniques(self, obj: ValidationTest):
+        techniques = getattr(obj, "active_techniques", None)
+        if techniques is None:
+            techniques = active_attack_techniques(obj.techniques.all())
+        return AttackTechniqueSerializer(techniques, many=True).data
 
 
 class ValidationResultSerializer(serializers.ModelSerializer):
@@ -275,6 +295,7 @@ class ThreatReportTechniqueSerializer(serializers.ModelSerializer):
             "technique_name",
             "confidence",
             "evidence_excerpt",
+            "review_status",
             "created_at",
             "updated_at",
         ]
@@ -367,13 +388,17 @@ class ManualThreatReportSerializer(serializers.Serializer):
             ).strip()
             if not technique_id:
                 raise serializers.ValidationError("Every technique needs a technique_id.")
+            requested_review = str(item.get("review_status") or "pending").strip().lower()
+            if requested_review != "pending":
+                raise serializers.ValidationError(
+                    "Imported ATT&CK mappings must begin in pending review."
+                )
             cleaned.append(
                 {
                     "technique_id": technique_id.upper(),
                     "name": str(item.get("name") or ""),
                     "confidence": int(item.get("confidence") or 50),
                     "evidence_excerpt": str(item.get("evidence_excerpt") or ""),
-                    "review_status": str(item.get("review_status") or "pending"),
                 }
             )
         return cleaned
@@ -432,9 +457,27 @@ class AssessmentSerializer(serializers.ModelSerializer):
             "started_at",
             "completed_at",
             "created_by_username",
+            "origin",
             "summary",
             "error_summary",
             "findings",
             "created_at",
             "updated_at",
         ]
+
+
+class SecurityAuditEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SecurityAuditEvent
+        fields = [
+            "id",
+            "actor_label",
+            "origin",
+            "event_type",
+            "target_type",
+            "target_identifier",
+            "timestamp",
+            "outcome",
+            "metadata",
+        ]
+        read_only_fields = fields

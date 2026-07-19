@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import socket
+from io import BytesIO
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 from urllib.request import Request
 
 from django.test import SimpleTestCase, override_settings
@@ -10,6 +12,7 @@ from integrations.adapters.http_client import HttpClientError
 from integrations.adapters.http_client import request_json as adapter_request_json
 from integrations.http import IntegrationHttpError
 from integrations.http import request_json as integration_request_json
+from integrations.http_response import ResponseTooLargeError, read_bounded_response
 from integrations.outbound import (
     UnsafeOutboundUrlError,
     _create_allowed_connection,
@@ -17,6 +20,7 @@ from integrations.outbound import (
     _ValidatedRedirectHandler,
     validate_outbound_url,
 )
+from integrations.secrets import redacted_result, validate_safe_cursor
 
 ALLOWED_HOST = "opencti.example.invalid"
 OTHER_HOST = "other.example.invalid"
@@ -497,3 +501,70 @@ class OutboundUrlValidationTests(SimpleTestCase):
             integration_request_json("file:///etc/passwd")
         with self.assertRaises(HttpClientError):
             adapter_request_json("file:///etc/passwd", retries=0)
+
+
+class BoundedHttpResponseTests(SimpleTestCase):
+    @override_settings(THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES=4)
+    def test_content_length_rejects_before_reading(self):
+        response = Mock()
+        response.headers = {"Content-Length": "5"}
+        with self.assertRaises(ResponseTooLargeError):
+            read_bounded_response(response)
+        response.read.assert_not_called()
+
+    @override_settings(THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES=4)
+    def test_streamed_body_is_bounded(self):
+        response = Mock()
+        response.headers = {}
+        response.read.return_value = b"12345"
+        with self.assertRaises(ResponseTooLargeError):
+            read_bounded_response(response)
+        response.read.assert_called_once_with(5)
+
+    @patch("integrations.http.open_outbound_request")
+    def test_http_error_omits_query_secrets_and_response_body(self, opener):
+        url = f"https://{ALLOWED_HOST}/data?access_token=do-not-store"
+        opener.side_effect = HTTPError(
+            url,
+            400,
+            "Bad request",
+            {},
+            BytesIO(b'{"message":"token do-not-store"}'),
+        )
+        with self.assertRaises(IntegrationHttpError) as raised:
+            integration_request_json(url)
+        message = str(raised.exception)
+        self.assertNotIn("access_token", message)
+        self.assertNotIn("do-not-store", message)
+        self.assertIn("HTTP 400", message)
+
+    def test_connector_result_redacts_resolved_secret_values_in_safe_fields(self):
+        result = redacted_result(
+            {
+                "ok": True,
+                "detail": "Connected using do-not-display-this-value",
+                "nested": {"status": "do-not-display-this-value"},
+            },
+            resolved_secrets={"value": "do-not-display-this-value"},
+        )
+
+        self.assertEqual(result["detail"], "<redacted>")
+        self.assertEqual(result["nested"]["status"], "<redacted>")
+
+    def test_connector_cursor_rejects_credentials_but_allows_continuation_tokens(self):
+        validate_safe_cursor(
+            {"next_url": f"https://{ALLOWED_HOST}/items?$skiptoken=opaque"}
+        )
+
+        unsafe_cursors = (
+            {"access_token": "dynamic-token"},
+            {"next_url": f"https://{ALLOWED_HOST}/items?access_token=dynamic-token"},
+            {"after": "prefix-known-secret-suffix"},
+        )
+        for cursor in unsafe_cursors:
+            with self.subTest(cursor=cursor):
+                with self.assertRaisesRegex(ValueError, "sensitive material"):
+                    validate_safe_cursor(
+                        cursor,
+                        resolved_secrets={"value": "known-secret"},
+                    )

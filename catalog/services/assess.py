@@ -16,6 +16,16 @@ from catalog.models import (
     ValidationResult,
     VulnerabilityFinding,
 )
+from catalog.provenance import (
+    active_attack_techniques,
+    active_detection_rules,
+    active_telemetry_sources,
+    active_validation_results,
+    attach_active_assessment_provenance,
+)
+from catalog.services.audit import record_security_event
+from integrations.models import ExternalObject
+from threatbridge.authorization import Permissions, require_operation_permission
 
 
 def _priority_rank(value: str) -> int:
@@ -34,14 +44,17 @@ def _technique_finding(
 ) -> GapFinding:
     technique = link.technique
     detections = list(
-        technique.detection_rules.filter(enabled=True)
+        active_detection_rules(technique.detection_rules.filter(enabled=True))
         .select_related("integration")
         .prefetch_related("telemetry_sources")
     )
 
     required_telemetry: dict[str, bool | None] = {}
     for detection in detections:
-        relations = detection.detectionruletelemetry_set.select_related("telemetry_source")
+        relations = detection.detectionruletelemetry_set.filter(
+            Q(telemetry_source__source_object__isnull=True)
+            | Q(telemetry_source__source_object__is_deleted=False)
+        ).select_related("telemetry_source")
         for relation in relations:
             if relation.required:
                 required_telemetry[relation.telemetry_source.name] = (
@@ -49,8 +62,8 @@ def _technique_finding(
                 )
 
     validations = (
-        ValidationResult.objects.filter(
-            Q(technique=technique) | Q(detection_rule__in=detections)
+        active_validation_results().filter(
+            Q(technique=technique) | Q(detection_rule__in=detections),
         )
         .select_related("test", "detection_rule")
         .order_by("-executed_at", "-created_at")
@@ -182,6 +195,7 @@ def _vulnerability_finding(assessment: Assessment, report_link) -> GapFinding:
         VulnerabilityFinding.objects.filter(
             vulnerability=vulnerability,
             status=VulnerabilityFinding.Status.OPEN,
+            source_object__is_deleted=False,
         ).select_related("asset", "product", "source_object__integration")
     )
     critical_count = sum(
@@ -272,69 +286,223 @@ def _vulnerability_finding(assessment: Assessment, report_link) -> GapFinding:
     )
 
 
-def generate_assessment(report: ThreatReport, created_by=None) -> Assessment:
-    assessment = Assessment.objects.create(report=report, created_by=created_by)
-    try:
-        with transaction.atomic():
-            technique_links = report.technique_links.filter(
-                review_status__in=[
-                    ThreatReportTechnique.ReviewStatus.APPROVED,
-                    ThreatReportTechnique.ReviewStatus.UNCERTAIN,
+def generate_assessment(
+    report: ThreatReport,
+    *,
+    actor=None,
+    origin: str,
+    system: bool = False,
+) -> Assessment:
+    require_operation_permission(
+        actor,
+        Permissions.RUN_ASSESSMENTS,
+        origin=origin,
+        system=system,
+    )
+    failure: Exception | None = None
+
+    with transaction.atomic():
+        locked_source = (
+            ExternalObject.all_objects.select_for_update()
+            .select_related("integration")
+            .get(pk=report.source_object_id)
+        )
+        if locked_source.is_deleted:
+            raise ValueError("Deleted source evidence cannot be assessed.")
+        report = ThreatReport.objects.select_related("source_object").get(
+            pk=report.pk,
+            source_object_id=locked_source.pk,
+        )
+        assessment = Assessment.objects.create(
+            report=report,
+            created_by=actor if getattr(actor, "is_authenticated", False) else None,
+            origin=origin,
+        )
+        record_security_event(
+            event_type="assessment.started",
+            origin=origin,
+            outcome="started",
+            actor=actor,
+            target_type="assessment",
+            target_identifier=assessment.pk,
+            metadata={"report_id": report.pk},
+        )
+
+        try:
+            with transaction.atomic():
+                technique_links = report.technique_links.filter(
+                    review_status__in=[
+                        ThreatReportTechnique.ReviewStatus.APPROVED,
+                        ThreatReportTechnique.ReviewStatus.UNCERTAIN,
+                    ]
+                ).select_related("technique")
+                vulnerability_links = report.vulnerability_links.select_related(
+                    "vulnerability"
+                )
+
+                for link in technique_links:
+                    _technique_finding(assessment, link)
+                for link in vulnerability_links:
+                    _vulnerability_finding(assessment, link)
+
+                technique_ids = list(
+                    technique_links.values_list("technique_id", flat=True)
+                )
+                vulnerability_ids = list(
+                    vulnerability_links.values_list("vulnerability_id", flat=True)
+                )
+                source_ids = {locked_source.pk}
+
+                detections = active_detection_rules().filter(
+                    techniques__id__in=technique_ids
+                )
+                source_ids.update(
+                    detections.values_list("source_object_id", flat=True)
+                )
+
+                validation_results = active_validation_results().filter(
+                    Q(technique_id__in=technique_ids)
+                    | Q(detection_rule__techniques__id__in=technique_ids)
+                )
+                source_ids.update(
+                    validation_results.values_list("source_object_id", flat=True)
+                )
+                source_ids.update(
+                    validation_results.exclude(test__source_object__isnull=True)
+                    .values_list("test__source_object_id", flat=True)
+                )
+
+                source_ids.update(
+                    active_attack_techniques()
+                    .filter(
+                        id__in=technique_ids,
+                        source_object__is_deleted=False,
+                    )
+                    .exclude(source_object__isnull=True)
+                    .values_list("source_object_id", flat=True)
+                )
+                source_ids.update(
+                    active_telemetry_sources()
+                    .filter(
+                        detection_rules__in=detections,
+                        source_object__is_deleted=False,
+                    )
+                    .exclude(source_object__isnull=True)
+                    .values_list("source_object_id", flat=True)
+                )
+                source_ids.update(
+                    ExternalObject.objects.filter(
+                        vulnerability_finding_projection__vulnerability_id__in=(
+                            vulnerability_ids
+                        ),
+                        vulnerability_finding_projection__status=(
+                            VulnerabilityFinding.Status.OPEN
+                        ),
+                    ).values_list("id", flat=True)
+                )
+                source_ids.update(
+                    ExternalObject.objects.filter(
+                        vulnerability_projections__vulnerability_id__in=(
+                            vulnerability_ids
+                        )
+                    ).values_list("id", flat=True)
+                )
+                source_ids.update(
+                    ExternalObject.objects.filter(
+                        asset_projection__asset__vulnerability_findings__vulnerability_id__in=(
+                            vulnerability_ids
+                        ),
+                        asset_projection__asset__vulnerability_findings__status=(
+                            VulnerabilityFinding.Status.OPEN
+                        ),
+                        asset_projection__asset__vulnerability_findings__source_object__is_deleted=(
+                            False
+                        ),
+                    ).values_list("id", flat=True)
+                )
+                attach_active_assessment_provenance(assessment, source_ids)
+                if not assessment.evidence_provenance_complete:
+                    raise ValueError(
+                        "Assessment provenance changed during execution; retry the assessment."
+                    )
+
+                findings = list(assessment.findings.all())
+                states = Counter(finding.state for finding in findings)
+                priorities = Counter(finding.priority for finding in findings)
+                highest_priority = max(
+                    (finding.priority for finding in findings),
+                    key=_priority_rank,
+                    default=GapFinding.Priority.INFO,
+                )
+                assessment.summary = {
+                    "finding_count": len(findings),
+                    "technique_count": sum(
+                        1
+                        for finding in findings
+                        if finding.category == GapFinding.Category.TECHNIQUE
+                    ),
+                    "vulnerability_count": sum(
+                        1
+                        for finding in findings
+                        if finding.category == GapFinding.Category.VULNERABILITY
+                    ),
+                    "pending_technique_reviews": report.technique_links.filter(
+                        review_status=ThreatReportTechnique.ReviewStatus.PENDING
+                    ).count(),
+                    "states": dict(states),
+                    "priorities": dict(priorities),
+                    "highest_priority": highest_priority,
+                }
+                assessment.status = Assessment.Status.SUCCEEDED
+                assessment.completed_at = timezone.now()
+                assessment.save(
+                    update_fields=[
+                        "summary",
+                        "status",
+                        "completed_at",
+                        "evidence_provenance_complete",
+                        "updated_at",
+                    ]
+                )
+        except Exception as exc:
+            failure = exc
+            assessment.status = Assessment.Status.FAILED
+            assessment.completed_at = timezone.now()
+            assessment.error_summary = f"{type(exc).__name__}: assessment failed"
+            assessment.save(
+                update_fields=[
+                    "status",
+                    "completed_at",
+                    "error_summary",
+                    "updated_at",
                 ]
-            ).select_related("technique")
-            vulnerability_links = report.vulnerability_links.select_related("vulnerability")
+            )
+            record_security_event(
+                event_type="assessment.completed",
+                origin=origin,
+                outcome="failed",
+                actor=actor,
+                target_type="assessment",
+                target_identifier=assessment.pk,
+                metadata={"report_id": report.pk, "error_type": type(exc).__name__},
+            )
+        else:
+            record_security_event(
+                event_type="assessment.completed",
+                origin=origin,
+                outcome="succeeded",
+                actor=actor,
+                target_type="assessment",
+                target_identifier=assessment.pk,
+                metadata={
+                    "report_id": report.pk,
+                    "finding_count": assessment.summary["finding_count"],
+                },
+            )
 
-            for link in technique_links:
-                _technique_finding(assessment, link)
-            for link in vulnerability_links:
-                _vulnerability_finding(assessment, link)
-
-        findings = list(assessment.findings.all())
-        states = Counter(finding.state for finding in findings)
-        priorities = Counter(finding.priority for finding in findings)
-        highest_priority = max(
-            (finding.priority for finding in findings),
-            key=_priority_rank,
-            default=GapFinding.Priority.INFO,
-        )
-        assessment.summary = {
-            "finding_count": len(findings),
-            "technique_count": sum(
-                1
-                for finding in findings
-                if finding.category == GapFinding.Category.TECHNIQUE
-            ),
-            "vulnerability_count": sum(
-                1
-                for finding in findings
-                if finding.category == GapFinding.Category.VULNERABILITY
-            ),
-            "pending_technique_reviews": report.technique_links.filter(
-                review_status=ThreatReportTechnique.ReviewStatus.PENDING
-            ).count(),
-            "states": dict(states),
-            "priorities": dict(priorities),
-            "highest_priority": highest_priority,
-        }
-        assessment.status = Assessment.Status.SUCCEEDED
-        assessment.completed_at = timezone.now()
-        assessment.save(
-            update_fields=["summary", "status", "completed_at", "updated_at"]
-        )
-        return assessment
-    except Exception as exc:
-        assessment.status = Assessment.Status.FAILED
-        assessment.completed_at = timezone.now()
-        assessment.error_summary = str(exc)[:4000]
-        assessment.save(
-            update_fields=[
-                "status",
-                "completed_at",
-                "error_summary",
-                "updated_at",
-            ]
-        )
-        raise
+    if failure is not None:
+        raise failure
+    return assessment
 
 
 run_assessment = generate_assessment

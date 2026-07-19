@@ -53,7 +53,10 @@ class ImportSourceFileCommandTests(TestCase):
         )
 
         self.assertEqual(Integration.objects.count(), 1)
-        self.assertEqual(SyncRun.objects.get().status, SyncRun.Status.SUCCEEDED)
+        run = SyncRun.objects.get()
+        self.assertEqual(run.status, SyncRun.Status.SUCCEEDED)
+        self.assertEqual(run.origin, "management:import_source_file")
+        self.assertIsNone(run.initiated_by)
         self.assertEqual(Asset.objects.get().hostname, "command-server.example")
         self.assertIn("records=1", output.getvalue())
         self.assertIn("projected=1", output.getvalue())

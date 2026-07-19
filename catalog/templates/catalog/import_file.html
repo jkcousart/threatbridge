@@ -93,11 +93,7 @@
             {{ form.updated_at_field }}
             {% for error in form.updated_at_field.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
           </div>
-          <div class="form-field">
-            <label for="{{ form.default_review_status.id_for_label }}">Threat-report ATT&amp;CK review state</label>
-            {{ form.default_review_status }}
-            <small>{{ form.default_review_status.help_text }}</small>
-          </div>
+          <p class="form-help">Imported ATT&amp;CK mappings always begin in pending analyst review.</p>
           <div class="checkbox-stack">
             <label class="checkbox-field">{{ form.strict_records }} <span>Stop on the first invalid record</span></label>
             <label class="checkbox-field">{{ form.sync_now }} <span>Import and project immediately</span></label>
@@ -179,7 +175,6 @@
     setValue("id_updated_at_field", selected.updated_at_field || "");
     setValue("id_delimiter", selected.delimiter || "");
     setValue("id_field_map", selected.field_map || {});
-    setValue("id_default_review_status", selected.default_review_status || "pending");
     document.getElementById("id_strict_records").checked = Boolean(selected.strict_records);
   });
 
