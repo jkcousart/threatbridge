@@ -1,0 +1,62 @@
+{% extends "catalog/base.html" %}
+{% block title %}{{ report.title }} · ThreatBridge{% endblock %}
+{% block content %}
+<nav class="breadcrumbs"><a href="{% url 'web-threat-report-list' %}">Threat reports</a><span>/</span><span>{{ report.title|truncatechars:70 }}</span></nav>
+<section class="page-heading report-heading">
+  <div>
+    <div class="eyebrow">{{ report.source_name|default:report.integration.name }} · {{ report.tlp|default:"unmarked"|upper }}</div>
+    <h1>{{ report.title }}</h1>
+    <p>{{ report.summary|default:"No summary was supplied by the source." }}</p>
+    <div class="metadata-line"><span>{{ report.confidence }}% confidence</span>{% if report.published_at %}<span>Published {{ report.published_at|date:"M j, Y H:i" }}</span>{% endif %}<span>Source evidence #{{ report.source_object_id }}</span></div>
+  </div>
+  <form method="post" action="{% url 'web-assess-report' report.pk %}">{% csrf_token %}<button class="button button-primary" type="submit">Generate assessment</button></form>
+</section>
+
+<div class="two-column wide-left">
+  <section class="panel">
+    <div class="panel-heading"><div><div class="eyebrow">Human validation</div><h2>ATT&amp;CK technique mappings</h2></div><span>{{ report.technique_links.count }} total</span></div>
+    <div class="mapping-list">
+      {% for link in report.technique_links.all %}
+        <article class="mapping-card">
+          <div class="mapping-main">
+            <div class="mapping-title"><code>{{ link.technique.technique_id }}</code><strong>{{ link.technique.name }}</strong><span class="badge badge-{{ link.review_status }}">{{ link.get_review_status_display }}</span></div>
+            <p>{{ link.evidence_excerpt|default:"No source excerpt was supplied." }}</p>
+            <small>{{ link.confidence }}% mapping confidence · {{ link.technique.detection_rules.count }} mapped detection{{ link.technique.detection_rules.count|pluralize }}</small>
+          </div>
+          <form class="review-form" method="post" action="{% url 'web-review-technique' link.pk %}">
+            {% csrf_token %}
+            <label for="review-{{ link.pk }}">Analyst decision</label>
+            <select id="review-{{ link.pk }}" name="review_status">
+              {% for value,label in review_choices %}<option value="{{ value }}" {% if value == link.review_status %}selected{% endif %}>{{ label }}</option>{% endfor %}
+            </select>
+            <button class="button button-small button-secondary" type="submit">Save</button>
+          </form>
+        </article>
+      {% empty %}<div class="empty-state">No ATT&amp;CK mappings were supplied.</div>{% endfor %}
+    </div>
+  </section>
+
+  <aside class="stack">
+    <section class="panel">
+      <div class="panel-heading"><h2>Referenced CVEs</h2><span>{{ report.vulnerability_links.count }}</span></div>
+      <div class="item-list compact-list">
+        {% for link in report.vulnerability_links.all %}
+          <div class="item-row"><span><strong>{{ link.vulnerability.cve_id }}</strong><small>{{ link.evidence_excerpt|default:"No excerpt" }}</small></span><span class="pill">{{ link.vulnerability.severity|default:"unknown"|upper }}</span></div>
+        {% empty %}<div class="empty-state">No CVEs referenced.</div>{% endfor %}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-heading"><h2>Observables</h2><span>{{ report.observables.count }}</span></div>
+      <div class="item-list compact-list">
+        {% for observable in report.observables.all %}<div class="item-row"><span><strong>{{ observable.observable_type }}</strong><small class="breakable">{{ observable.value }}</small></span><span>{{ observable.confidence }}%</span></div>{% empty %}<div class="empty-state">No observables supplied.</div>{% endfor %}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-heading"><h2>Assessment history</h2><span>{{ report.assessments.count }}</span></div>
+      <div class="item-list compact-list">
+        {% for assessment in assessments %}<a class="item-row" href="{% url 'web-assessment-detail' assessment.pk %}"><span><strong>{{ assessment.started_at|date:"M j, Y H:i" }}</strong><small>{{ assessment.summary.finding_count|default:0 }} findings</small></span><span class="badge badge-{{ assessment.status }}">{{ assessment.get_status_display }}</span></a>{% empty %}<div class="empty-state">No assessment has been run.</div>{% endfor %}
+      </div>
+    </section>
+  </aside>
+</div>
+{% endblock %}

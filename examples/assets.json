@@ -1,0 +1,18 @@
+{
+  "results": [
+    {
+      "deviceId": "asset-json-001",
+      "deviceName": "json-server-01.example",
+      "platform": "Windows Server 2022",
+      "criticality": "critical",
+      "internetExposed": true
+    },
+    {
+      "deviceId": "asset-json-002",
+      "deviceName": "json-server-02.example",
+      "platform": "Linux",
+      "criticality": "high",
+      "internetExposed": false
+    }
+  ]
+}

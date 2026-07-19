@@ -1,0 +1,27 @@
+[
+  {
+    "external_id": "asset-001",
+    "object_type": "asset",
+    "natural_key": "server-01",
+    "source_updated_at": "2026-07-18T12:00:00Z",
+    "normalized": {
+      "asset_external_id": "asset-001",
+      "hostname": "server-01.example",
+      "os_platform": "Windows Server 2022",
+      "criticality": "critical",
+      "internet_exposed": true
+    }
+  },
+  {
+    "external_id": "vulnerability-cve-2026-9999",
+    "object_type": "vulnerability",
+    "natural_key": "CVE-2026-9999",
+    "normalized": {
+      "cve_id": "CVE-2026-9999",
+      "title": "Example public-facing application vulnerability",
+      "severity": "high",
+      "cvss_score": 8.8,
+      "exploit_available": true
+    }
+  }
+]

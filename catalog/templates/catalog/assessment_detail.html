@@ -1,0 +1,39 @@
+{% extends "catalog/base.html" %}
+{% load catalog_extras %}
+{% block title %}Assessment · {{ assessment.report.title }}{% endblock %}
+{% block content %}
+<nav class="breadcrumbs"><a href="{% url 'web-threat-report-detail' assessment.report.pk %}">{{ assessment.report.title|truncatechars:55 }}</a><span>/</span><span>Assessment {{ assessment.id }}</span></nav>
+<section class="page-heading assessment-heading">
+  <div>
+    <div class="eyebrow">Explainable assessment · {{ assessment.get_status_display }}</div>
+    <h1>{{ assessment.report.title }}</h1>
+    <p>Every finding below records the detections, telemetry, validation results, assets, and source systems used to reach its state.</p>
+    <div class="metadata-line"><span>{{ assessment.summary.finding_count|default:0 }} findings</span><span>{{ assessment.summary.pending_technique_reviews|default:0 }} technique mappings excluded pending review</span>{% if assessment.completed_at %}<span>Completed {{ assessment.completed_at|date:"M j, Y H:i" }}</span>{% endif %}</div>
+  </div>
+  <a class="button button-secondary" href="{% url 'web-threat-report-detail' assessment.report.pk %}">Back to report</a>
+</section>
+
+<section class="metric-grid assessment-metrics">
+  <article class="metric-card"><span>Highest priority</span><strong class="text-{{ assessment.summary.highest_priority }}">{{ assessment.summary.highest_priority|default:"info"|title }}</strong><small>Across all findings</small></article>
+  <article class="metric-card"><span>Techniques</span><strong>{{ assessment.summary.technique_count|default:0 }}</strong><small>Approved or uncertain mappings</small></article>
+  <article class="metric-card"><span>Vulnerabilities</span><strong>{{ assessment.summary.vulnerability_count|default:0 }}</strong><small>Referenced CVEs assessed</small></article>
+  <article class="metric-card"><span>Pending review</span><strong>{{ assessment.summary.pending_technique_reviews|default:0 }}</strong><small>Excluded from assessment</small></article>
+</section>
+
+<section class="finding-stack">
+  {% for finding in findings %}
+    <article class="finding-card priority-{{ finding.priority }}">
+      <header class="finding-header">
+        <div><div class="eyebrow">{{ finding.get_category_display }}</div><h2>{{ finding.title }}</h2></div>
+        <div class="finding-badges"><span class="badge badge-{{ finding.priority }}">{{ finding.get_priority_display }}</span><span class="badge badge-{{ finding.state }}">{{ finding.get_state_display }}</span></div>
+      </header>
+      <div class="finding-grid">
+        <div><h3>Why this state</h3><p>{{ finding.rationale }}</p></div>
+        <div><h3>Recommended action</h3><p>{{ finding.recommendation }}</p></div>
+      </div>
+      {% if finding.affected_asset_count %}<div class="evidence-callout"><strong>{{ finding.affected_asset_count }}</strong> affected asset{{ finding.affected_asset_count|pluralize }}, including <strong>{{ finding.critical_asset_count }}</strong> critical.</div>{% endif %}
+      <details class="evidence-detail"><summary>Show supporting evidence</summary><pre>{{ finding.evidence|pretty_json }}</pre></details>
+    </article>
+  {% empty %}<div class="empty-state">This assessment produced no findings. Pending mappings may need analyst review.</div>{% endfor %}
+</section>
+{% endblock %}

@@ -1,0 +1,94 @@
+{% extends "catalog/base.html" %}
+{% load catalog_extras %}
+{% block title %}Dashboard · ThreatBridge{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <div class="eyebrow">Operational overview</div>
+    <h1>Threat-to-control posture</h1>
+    <p>Correlate imported threat intelligence with assets, exposure, detections, telemetry, and validation evidence.</p>
+  </div>
+  <div class="heading-actions">
+    <a class="button button-secondary" href="{% url 'web-integration-list' %}">Manage integrations</a>
+    <a class="button button-primary" href="{% url 'web-threat-report-list' %}">Review reports</a>
+  </div>
+</section>
+
+<section class="metric-grid" aria-label="Environment summary">
+  <article class="metric-card"><span>Assets</span><strong>{{ asset_count }}</strong><small>Canonical inventory</small></article>
+  <article class="metric-card"><span>Open CVE findings</span><strong>{{ open_vulnerability_count }}</strong><small>Across imported sources</small></article>
+  <article class="metric-card"><span>Enabled detections</span><strong>{{ enabled_detection_count }}</strong><small>Mapped control rules</small></article>
+  <article class="metric-card"><span>Threat reports</span><strong>{{ report_count }}</strong><small>{{ pending_review_count }} mappings pending</small></article>
+  <article class="metric-card"><span>Integrations</span><strong>{{ integration_count }}</strong><small>{{ unhealthy_integration_count }} need attention</small></article>
+</section>
+
+<div class="two-column">
+  <section class="panel">
+    <div class="panel-heading">
+      <div><div class="eyebrow">Latest intelligence</div><h2>Threat reports</h2></div>
+      <a href="{% url 'web-threat-report-list' %}">View all</a>
+    </div>
+    {% if latest_reports %}
+      <div class="item-list">
+        {% for report in latest_reports %}
+          <a class="item-row" href="{% url 'web-threat-report-detail' report.pk %}">
+            <span>
+              <strong>{{ report.title }}</strong>
+              <small>{{ report.source_name|default:report.integration.name }}{% if report.published_at %} · {{ report.published_at|date:"M j, Y H:i" }}{% endif %}</small>
+            </span>
+            <span class="pill">{{ report.tlp|default:"unmarked"|upper }}</span>
+          </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state">No threat reports are available. Synchronize the demo or another intelligence integration.</div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <div><div class="eyebrow">Connector activity</div><h2>Recent sync runs</h2></div>
+      <a href="{% url 'web-integration-list' %}">Open integrations</a>
+    </div>
+    {% if latest_runs %}
+      <div class="item-list">
+        {% for run in latest_runs %}
+          <div class="item-row">
+            <span>
+              <strong>{{ run.integration.name }}</strong>
+              <small>{{ run.started_at|date:"M j, Y H:i" }} · {{ run.records_accepted }} accepted / {{ run.records_rejected }} rejected</small>
+            </span>
+            <span class="badge badge-{{ run.status }}">{{ run.get_status_display }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state">No integration has run yet.</div>
+    {% endif %}
+  </section>
+</div>
+
+<section class="panel assessment-summary">
+  <div class="panel-heading">
+    <div><div class="eyebrow">Most recent assessment</div><h2>Explainable coverage result</h2></div>
+    {% if latest_assessment %}<a href="{% url 'web-assessment-detail' latest_assessment.pk %}">Open assessment</a>{% endif %}
+  </div>
+  {% if latest_assessment %}
+    <div class="assessment-hero">
+      <div>
+        <h3>{{ latest_assessment.report.title }}</h3>
+        <p>{{ latest_assessment.summary.finding_count }} findings generated {{ latest_assessment.completed_at|date:"M j, Y H:i" }}.</p>
+      </div>
+      <div class="priority-strip">
+        <span><b>{{ priority_counts.critical|default:0 }}</b> Critical</span>
+        <span><b>{{ priority_counts.high|default:0 }}</b> High</span>
+        <span><b>{{ priority_counts.medium|default:0 }}</b> Medium</span>
+        <span><b>{{ priority_counts.low|default:0 }}</b> Low</span>
+        <span><b>{{ priority_counts.info|default:0 }}</b> Informational</span>
+      </div>
+    </div>
+  {% else %}
+    <div class="empty-state">Review a threat report and generate an assessment to see coverage and exposure gaps here.</div>
+  {% endif %}
+</section>
+{% endblock %}

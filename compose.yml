@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: threatbridge
+      POSTGRES_USER: threatbridge
+      POSTGRES_PASSWORD: threatbridge-dev-only
+    volumes:
+      - threatbridge-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threatbridge -d threatbridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    command: >-
+      sh -c "python manage.py migrate &&
+             gunicorn threatbridge.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 90"
+    environment:
+      DJANGO_DEBUG: "true"
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+      DJANGO_CSRF_TRUSTED_ORIGINS: http://localhost:8000,http://127.0.0.1:8000
+      DJANGO_TIME_ZONE: America/Edmonton
+      DATABASE_URL: postgresql://threatbridge:threatbridge-dev-only@db:5432/threatbridge
+      THREATBRIDGE_DATA_DIR: /app/data
+      THREATBRIDGE_MAX_UPLOAD_BYTES: "52428800"
+      THREATBRIDGE_MAX_IMPORT_RECORDS: "100000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - threatbridge-data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  threatbridge-db:
+  threatbridge-data:

@@ -1,0 +1,2 @@
+{"device":{"identity":{"id":"asset-jsonl-001"},"name":"jsonl-server-01.example","platform":"Linux"},"criticality":"high","internet_exposed":false}
+{"device":{"identity":{"id":"asset-jsonl-002"},"name":"jsonl-server-02.example","platform":"Windows Server 2022"},"criticality":"critical","internet_exposed":true}

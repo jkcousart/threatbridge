@@ -1,0 +1,21 @@
+{% extends "catalog/base.html" %}
+{% block title %}Threat reports · ThreatBridge{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div><div class="eyebrow">Intelligence review</div><h1>Threat reports</h1><p>Approve mappings, inspect evidence, and generate coverage assessments.</p></div>
+</section>
+<section class="panel">
+  <form method="get" class="filter-bar compact"><input type="search" name="q" value="{{ query }}" placeholder="Search title, summary, or source"><button class="button button-secondary" type="submit">Search</button></form>
+  <div class="report-grid">
+    {% for report in reports %}
+      <a class="report-card" href="{% url 'web-threat-report-detail' report.pk %}">
+        <div class="report-card-top"><span class="pill">{{ report.tlp|default:"unmarked"|upper }}</span><span class="muted">{{ report.confidence }}% confidence</span></div>
+        <h2>{{ report.title }}</h2>
+        <p>{{ report.summary|truncatewords:30 }}</p>
+        <div class="report-meta"><span>{{ report.source_name|default:report.integration.name }}</span>{% if report.published_at %}<span>{{ report.published_at|date:"M j, Y" }}</span>{% endif %}</div>
+        <div class="report-stats"><span><b>{{ report.technique_count }}</b> techniques</span><span><b>{{ report.vulnerability_count }}</b> CVEs</span><span><b>{{ report.assessment_count }}</b> assessments</span>{% if report.pending_count %}<span class="warning-text"><b>{{ report.pending_count }}</b> pending</span>{% endif %}</div>
+      </a>
+    {% empty %}<div class="empty-state full-span">No threat reports have been imported.</div>{% endfor %}
+  </div>
+</section>
+{% endblock %}

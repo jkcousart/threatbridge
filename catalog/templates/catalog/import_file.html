@@ -1,0 +1,238 @@
+{% extends "catalog/base.html" %}
+{% block title %}Import CSV or JSON · ThreatBridge{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <div class="eyebrow">File ingestion</div>
+    <h1>Import CSV or JSON</h1>
+    <p>Upload a vendor export, preview its schema, map source fields, and project the records into ThreatBridge. The integration remains available as a reusable import profile.</p>
+  </div>
+  <a class="button button-secondary" href="{% url 'web-integration-list' %}">Back to integrations</a>
+</section>
+
+<div class="two-column wide-left import-layout">
+  <section class="panel">
+    <div class="panel-heading">
+      <div><div class="eyebrow">Import configuration</div><h2>Source and mapping</h2></div>
+      <span class="pill">Up to {{ max_upload_mb }} MB</span>
+    </div>
+    <form id="file-import-form" class="import-form" method="post" enctype="multipart/form-data" novalidate>
+      {% csrf_token %}
+      {% if form.non_field_errors %}
+        <div class="form-errors full-span-field">{% for error in form.non_field_errors %}<div>{{ error }}</div>{% endfor %}</div>
+      {% endif %}
+
+      <div class="form-field full-span-field">
+        <label for="{{ form.file.id_for_label }}">{{ form.file.label }}</label>
+        {{ form.file }}
+        <small>{{ form.file.help_text }}</small>
+        {% for error in form.file.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+      </div>
+
+      <div class="form-field">
+        <label for="{{ form.integration.id_for_label }}">{{ form.integration.label }}</label>
+        {{ form.integration }}
+        <small>{{ form.integration.help_text }}</small>
+        {% for error in form.integration.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+      </div>
+
+      <div class="form-field">
+        <label for="{{ form.name.id_for_label }}">{{ form.name.label }}</label>
+        {{ form.name }}
+        <small>{{ form.name.help_text }}</small>
+        {% for error in form.name.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+      </div>
+
+      <div class="form-field">
+        <label for="{{ form.object_type.id_for_label }}">Normalized object type</label>
+        {{ form.object_type }}
+        <small>{{ form.object_type.help_text }}</small>
+        {% for error in form.object_type.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+      </div>
+
+      <div class="form-field">
+        <label for="{{ form.id_fields.id_for_label }}">{{ form.id_fields.label }}</label>
+        {{ form.id_fields }}
+        <small>{{ form.id_fields.help_text }}</small>
+        {% for error in form.id_fields.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+      </div>
+
+      <div class="form-actions full-span-field preview-actions">
+        <button id="preview-button" class="button button-secondary" type="button">Preview and suggest mapping</button>
+        <span id="preview-status" class="muted" role="status" aria-live="polite">No preview has run.</span>
+      </div>
+
+      <details class="advanced-fields full-span-field" open>
+        <summary>Field mapping and advanced options</summary>
+        <div class="advanced-grid">
+          <div class="form-field full-span-field">
+            <label for="{{ form.field_map.id_for_label }}">Field map</label>
+            {{ form.field_map }}
+            <small>{{ form.field_map.help_text }}</small>
+            {% for error in form.field_map.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+          </div>
+          <div class="form-field">
+            <label for="{{ form.records_key.id_for_label }}">JSON records key</label>
+            {{ form.records_key }}
+            <small>{{ form.records_key.help_text }}</small>
+            {% for error in form.records_key.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+          </div>
+          <div class="form-field">
+            <label for="{{ form.delimiter.id_for_label }}">CSV delimiter</label>
+            {{ form.delimiter }}
+            <small>{{ form.delimiter.help_text }}</small>
+            {% for error in form.delimiter.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+          </div>
+          <div class="form-field">
+            <label for="{{ form.natural_key_field.id_for_label }}">Natural-key field</label>
+            {{ form.natural_key_field }}
+            {% for error in form.natural_key_field.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+          </div>
+          <div class="form-field">
+            <label for="{{ form.updated_at_field.id_for_label }}">Source updated-at field</label>
+            {{ form.updated_at_field }}
+            {% for error in form.updated_at_field.errors %}<div class="field-error">{{ error }}</div>{% endfor %}
+          </div>
+          <div class="form-field">
+            <label for="{{ form.default_review_status.id_for_label }}">Threat-report ATT&amp;CK review state</label>
+            {{ form.default_review_status }}
+            <small>{{ form.default_review_status.help_text }}</small>
+          </div>
+          <div class="checkbox-stack">
+            <label class="checkbox-field">{{ form.strict_records }} <span>Stop on the first invalid record</span></label>
+            <label class="checkbox-field">{{ form.sync_now }} <span>Import and project immediately</span></label>
+          </div>
+        </div>
+      </details>
+
+      <div class="form-actions full-span-field">
+        <button class="button button-primary" type="submit">Upload and import</button>
+        <a class="button button-ghost" href="{% url 'web-integration-list' %}">Cancel</a>
+      </div>
+    </form>
+  </section>
+
+  <aside class="stack">
+    <section class="panel preview-panel">
+      <div class="panel-heading">
+        <div><div class="eyebrow">Schema preview</div><h2>Detected data</h2></div>
+      </div>
+      <div id="preview-empty" class="empty-state">Choose a file, then run the preview. ThreatBridge will detect columns, count records, and suggest a projection profile.</div>
+      <div id="preview-result" class="preview-result" hidden>
+        <div class="preview-metrics">
+          <div><small>Format</small><strong id="preview-format">—</strong></div>
+          <div><small>Records</small><strong id="preview-count">—</strong></div>
+          <div><small>Fields</small><strong id="preview-field-count">—</strong></div>
+        </div>
+        <div class="preview-section">
+          <h3>Detected fields</h3>
+          <div id="preview-fields" class="tag-cloud"></div>
+        </div>
+        <div class="preview-section">
+          <h3>Sample records</h3>
+          <pre id="preview-sample"></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel import-guidance">
+      <div class="panel-heading"><div><div class="eyebrow">Supported modes</div><h2>What can be imported</h2></div></div>
+      <div class="item-list compact-list">
+        <div class="item-row"><span><strong>CSV</strong><small>One normalized object type per file, with composite ID support.</small></span></div>
+        <div class="item-row"><span><strong>JSON or JSON Lines</strong><small>Arrays, single objects, nested record keys, and dotted source-field paths.</small></span></div>
+        <div class="item-row"><span><strong>ThreatBridge envelope JSON</strong><small>Mixed assets, CVEs, detections, tests, and reports in one file.</small></span></div>
+        <div class="item-row"><span><strong>Evidence preservation</strong><small>The original row or object is retained beside its normalized projection.</small></span></div>
+      </div>
+    </section>
+  </aside>
+</div>
+
+{{ profiles|json_script:"file-import-profiles" }}
+<script>
+(function () {
+  const form = document.getElementById("file-import-form");
+  const previewButton = document.getElementById("preview-button");
+  const status = document.getElementById("preview-status");
+  const fileInput = document.getElementById("id_file");
+  const objectType = document.getElementById("id_object_type");
+  const idFields = document.getElementById("id_id_fields");
+  const recordsKey = document.getElementById("id_records_key");
+  const delimiter = document.getElementById("id_delimiter");
+  const fieldMap = document.getElementById("id_field_map");
+  const profileSelect = document.getElementById("id_integration");
+  const profileData = JSON.parse(document.getElementById("file-import-profiles").textContent || "[]");
+
+  function setValue(id, value) {
+    const element = document.getElementById(id);
+    if (!element || value === undefined || value === null) return;
+    element.value = typeof value === "object" ? JSON.stringify(value, null, 2) : value;
+  }
+
+  profileSelect.addEventListener("change", function () {
+    const selected = profileData.find((profile) => String(profile.id) === profileSelect.value);
+    if (!selected) return;
+    setValue("id_name", selected.name);
+    setValue("id_object_type", selected.object_type || "auto");
+    setValue("id_id_fields", selected.id_fields || "");
+    setValue("id_records_key", selected.records_key || "");
+    setValue("id_natural_key_field", selected.natural_key_field || "");
+    setValue("id_updated_at_field", selected.updated_at_field || "");
+    setValue("id_delimiter", selected.delimiter || "");
+    setValue("id_field_map", selected.field_map || {});
+    setValue("id_default_review_status", selected.default_review_status || "pending");
+    document.getElementById("id_strict_records").checked = Boolean(selected.strict_records);
+  });
+
+  previewButton.addEventListener("click", async function () {
+    if (!fileInput.files.length) {
+      status.textContent = "Choose a file first.";
+      status.classList.add("field-error");
+      return;
+    }
+    status.classList.remove("field-error");
+    status.textContent = "Inspecting file…";
+    previewButton.disabled = true;
+    const payload = new FormData();
+    payload.append("file", fileInput.files[0]);
+    payload.append("object_type", objectType.value || "auto");
+    payload.append("records_key", recordsKey.value || "");
+    payload.append("delimiter", delimiter.value || "");
+    payload.append("csrfmiddlewaretoken", form.querySelector("[name=csrfmiddlewaretoken]").value);
+    try {
+      const response = await fetch("{% url 'web-file-import-preview' %}", {
+        method: "POST",
+        body: payload,
+        credentials: "same-origin"
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Preview failed.");
+      if (objectType.value === "auto") objectType.value = data.suggested_object_type;
+      if (!idFields.value.trim()) idFields.value = (data.suggested_id_fields || []).join(",");
+      if (!recordsKey.value.trim() && data.records_key) recordsKey.value = data.records_key;
+      if (!delimiter.value && data.delimiter) delimiter.value = data.delimiter === "\t" ? "\\t" : data.delimiter;
+      if (!fieldMap.value.trim() || fieldMap.value.trim() === "{}") {
+        fieldMap.value = JSON.stringify(data.suggested_field_map || {}, null, 2);
+      }
+      document.getElementById("preview-format").textContent = data.file_format.toUpperCase();
+      document.getElementById("preview-count").textContent = Number(data.record_count).toLocaleString();
+      document.getElementById("preview-field-count").textContent = data.fields.length;
+      const fieldContainer = document.getElementById("preview-fields");
+      fieldContainer.replaceChildren(...data.fields.map((field) => {
+        const tag = document.createElement("span");
+        tag.textContent = field;
+        return tag;
+      }));
+      document.getElementById("preview-sample").textContent = JSON.stringify(data.sample_records, null, 2);
+      document.getElementById("preview-empty").hidden = true;
+      document.getElementById("preview-result").hidden = false;
+      status.textContent = `Previewed ${Number(data.record_count).toLocaleString()} records. Suggestions applied.`;
+    } catch (error) {
+      status.textContent = error.message;
+      status.classList.add("field-error");
+    } finally {
+      previewButton.disabled = false;
+    }
+  });
+})();
+</script>
+{% endblock %}

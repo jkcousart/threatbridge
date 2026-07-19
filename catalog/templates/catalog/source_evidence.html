@@ -1,0 +1,33 @@
+{% extends "catalog/base.html" %}
+{% block title %}Source evidence · ThreatBridge{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div><div class="eyebrow">Provenance index</div><h1>Source evidence</h1><p>Inspect normalized values derived from the latest source record retained for each external object.</p></div>
+</section>
+<section class="panel">
+  <form method="get" class="filter-bar">
+    <input type="search" name="q" value="{{ filters.q }}" placeholder="External ID, natural key, or normalized value">
+    <select name="integration"><option value="">All integrations</option>{% for integration in integrations %}<option value="{{ integration.slug }}" {% if filters.integration == integration.slug %}selected{% endif %}>{{ integration.name }}</option>{% endfor %}</select>
+    <select name="object_type"><option value="">All object types</option>{% for value in object_types %}<option value="{{ value }}" {% if filters.object_type == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select>
+    <select name="projection_status"><option value="">All projection states</option>{% for value,label in projection_choices %}<option value="{{ value }}" {% if filters.projection_status == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+    <button class="button button-secondary" type="submit">Filter</button>
+  </form>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Integration</th><th>Type</th><th>External ID</th><th>Natural key</th><th>Projection</th><th>Last seen</th></tr></thead>
+      <tbody>
+      {% for object in objects %}
+        <tr>
+          <td>{{ object.integration.name }}</td>
+          <td><code>{{ object.object_type }}</code></td>
+          <td><span class="breakable">{{ object.external_id }}</span></td>
+          <td>{{ object.natural_key|default:"—" }}</td>
+          <td><span class="badge badge-{{ object.projection_status }}">{{ object.get_projection_status_display }}</span>{% if object.projection_error %}<small class="block error-text">{{ object.projection_error }}</small>{% endif %}</td>
+          <td>{{ object.last_seen_at|date:"M j, Y H:i" }}</td>
+        </tr>
+      {% empty %}<tr><td colspan="6" class="empty-cell">No evidence matches these filters.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

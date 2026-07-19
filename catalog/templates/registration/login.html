@@ -1,0 +1,23 @@
+{% extends "catalog/base.html" %}
+{% block title %}Sign in · ThreatBridge{% endblock %}
+{% block content %}
+<section class="auth-wrap">
+  <div class="auth-card">
+    <div class="eyebrow">Analyst access</div>
+    <h1>Sign in to ThreatBridge</h1>
+    <p>Review threat mappings, inspect integration evidence, and generate control-gap assessments.</p>
+    {% if form.errors %}
+      <div class="message message-error">The username or password was not accepted.</div>
+    {% endif %}
+    <form method="post" class="stacked-form">
+      {% csrf_token %}
+      <label for="id_username">Username</label>
+      {{ form.username }}
+      <label for="id_password">Password</label>
+      {{ form.password }}
+      {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+      <button class="button button-primary" type="submit">Sign in</button>
+    </form>
+  </div>
+</section>
+{% endblock %}

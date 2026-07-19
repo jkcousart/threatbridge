@@ -1,0 +1,57 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+.env
+.venv/
+.pytest_cache/
+.ruff_cache/
+staticfiles/
+data/incoming/*
+!data/incoming/.gitkeep
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+secrets/
+.secrets/
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Runtime data
+db.sqlite3
+*.sqlite3
+media/
+incoming/
+uploads/
+
+# Test and security scan output
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+security-reports/
+bandit-report.*
+pip-audit-report.*
+gitleaks-report.*
+*.log
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

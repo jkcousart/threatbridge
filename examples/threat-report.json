@@ -1,0 +1,19 @@
+{
+  "reports": [
+    {
+      "report_id": "example-report-001",
+      "title": "Example healthcare-targeting campaign",
+      "summary": "A sample report for testing ThreatBridge file ingestion.",
+      "source_name": "Example intelligence source",
+      "published_at": "2026-07-18T18:30:00Z",
+      "confidence": 80,
+      "tlp": "clear",
+      "targeted_industries": ["healthcare"],
+      "techniques": ["T1190", "T1059.001"],
+      "vulnerabilities": ["CVE-2026-9999"],
+      "observables": [
+        {"type": "domain", "value": "malicious.example", "confidence": 75}
+      ]
+    }
+  ]
+}

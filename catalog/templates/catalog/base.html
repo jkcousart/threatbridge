@@ -1,0 +1,55 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="ThreatBridge threat-to-control correlation platform">
+  <title>{% block title %}ThreatBridge{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'catalog/app.css' %}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{% url 'dashboard' %}" aria-label="ThreatBridge dashboard">
+      <span class="brand-mark" aria-hidden="true">TB</span>
+      <span>
+        <strong>ThreatBridge</strong>
+        <small>Threat-to-control evidence</small>
+      </span>
+    </a>
+    {% if user.is_authenticated %}
+      <nav class="nav" aria-label="Primary navigation">
+        <a href="{% url 'dashboard' %}">Dashboard</a>
+        <a href="{% url 'web-threat-report-list' %}">Threat reports</a>
+        <a href="{% url 'web-integration-list' %}">Integrations</a>
+        {% if user.is_staff %}<a href="{% url 'web-file-import-new' %}">Import data</a>{% endif %}
+        <a href="{% url 'web-source-evidence-list' %}">Evidence</a>
+        {% if user.is_staff %}<a href="{% url 'admin:index' %}">Admin</a>{% endif %}
+      </nav>
+      <div class="account">
+        <span>{{ user.get_username }}</span>
+        <form action="{% url 'logout' %}" method="post">
+          {% csrf_token %}
+          <button class="link-button" type="submit">Sign out</button>
+        </form>
+      </div>
+    {% endif %}
+  </header>
+
+  <main class="page-shell">
+    {% if messages %}
+      <div class="messages" aria-live="polite">
+        {% for message in messages %}
+          <div class="message message-{{ message.tags|default:'info' }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <span>ThreatBridge MVP</span>
+    <span>Read-only integrations by default</span>
+  </footer>
+</body>
+</html>

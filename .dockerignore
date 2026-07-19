@@ -1,0 +1,70 @@
+# Version control and local agent metadata
+.git
+.github
+.agents
+.codex
+.codex-*
+**/.codex-*
+
+# Virtual environments and Python-generated files
+.venv
+venv
+.virtualenv
+.tox
+.nox
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# Local configuration and secrets
+.env
+.env.*
+.secrets
+
+# Databases and runtime data
+**/*.sqlite3
+**/*.db
+/data/incoming
+/data/runtime/**
+/data/uploads/**
+/media/**
+/uploads/**
+/runtime/**
+
+# Test, lint, type-check, and coverage output
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+
+# Private security work products; public architecture/deployment docs remain included
+security-reports
+docs/security/tmkb*
+docs/security/*audit-report*
+docs/security/*hardening-report*
+docs/security/private-*
+
+# Archives and logs
+**/*.zip
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*.log
+
+# Packaging metadata and build output
+*.egg-info
+**/*.dist-info
+**/*.whl
+.eggs
+/build
+dist
+pip-wheel-metadata
+
+# Editor and operating-system files
+.vscode
+.idea
+**/.DS_Store
+**/Thumbs.db

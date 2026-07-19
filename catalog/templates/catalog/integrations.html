@@ -1,0 +1,54 @@
+{% extends "catalog/base.html" %}
+{% block title %}Integrations · ThreatBridge{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <div class="eyebrow">Connector operations</div>
+    <h1>Integrations</h1>
+    <p>Each adapter stores the latest hashed source record before projecting it into the canonical ThreatBridge catalog.</p>
+  </div>
+  {% if user.is_staff %}
+    <div class="heading-actions">
+      <a class="button button-secondary" href="{% url 'web-file-import-new' %}">Import CSV / JSON</a>
+      <a class="button button-primary" href="{% url 'admin:integrations_integration_add' %}">Add API integration</a>
+    </div>
+  {% endif %}
+</section>
+
+<section class="panel table-panel">
+  {% if integrations %}
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Name</th><th>Adapter</th><th>Health</th><th>Evidence</th><th>Last success</th><th>Last run</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for integration in integrations %}
+        <tr>
+          <td><strong>{{ integration.name }}</strong><small class="block">{{ integration.get_kind_display }} · {{ integration.slug }}</small></td>
+          <td><code>{{ integration.adapter_path }}</code></td>
+          <td><span class="badge badge-{{ integration.health }}">{{ integration.get_health_display }}</span>{% if not integration.enabled %}<span class="pill">Disabled</span>{% endif %}</td>
+          <td>{{ integration.object_count }}</td>
+          <td>{% if integration.last_success_at %}{{ integration.last_success_at|date:"M j, Y H:i" }}{% else %}<span class="muted">Never</span>{% endif %}</td>
+          <td>
+            {% with run=integration.sync_runs.first %}
+              {% if run %}<span class="badge badge-{{ run.status }}">{{ run.get_status_display }}</span><small class="block">{{ run.records_accepted }} accepted</small>{% else %}<span class="muted">No runs</span>{% endif %}
+            {% endwith %}
+          </td>
+          <td>
+            {% if user.is_staff %}
+              <div class="inline-actions">
+                <form method="post" action="{% url 'web-integration-test' integration.pk %}">{% csrf_token %}<button class="button button-small button-secondary" type="submit">Test</button></form>
+                <form method="post" action="{% url 'web-integration-sync' integration.pk %}">{% csrf_token %}<button class="button button-small button-primary" type="submit" {% if not integration.enabled %}disabled{% endif %}>Sync</button></form>
+                {% if integration.adapter_path == "integrations.adapters.csv_inventory.CsvInventoryAdapter" or integration.adapter_path == "integrations.adapters.json_file.JsonFileAdapter" %}<a class="button button-small button-secondary" href="{% url 'web-file-import-new' %}?profile={{ integration.pk }}">Upload file</a>{% endif %}
+                <a class="button button-small button-ghost" href="{% url 'admin:integrations_integration_change' integration.pk %}">Configure</a>
+              </div>
+            {% else %}<span class="muted">Staff only</span>{% endif %}
+          </td>
+        </tr>
+        {% if integration.last_error %}<tr class="error-row"><td colspan="7"><strong>Last error:</strong> {{ integration.last_error }}</td></tr>{% endif %}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty-state">No integrations are configured.</div>{% endif %}
+</section>
+{% endblock %}
