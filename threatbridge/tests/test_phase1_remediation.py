@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
 from types import SimpleNamespace
 
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.core.paginator import UnorderedObjectListWarning
 from django.db import transaction
 from django.test import Client, TestCase
 from django.urls import reverse
@@ -245,6 +247,7 @@ class EvidenceDeletionLookupRemediationTests(TestCase):
     def setUpTestData(cls):
         cls.auditor = get_user_model().objects.create_user("delete-auditor")
         grant(cls.auditor, "integrations", "view_restricted_source_evidence")
+        grant(cls.auditor, "integrations", "view_deleted_source_evidence")
         grant(cls.auditor, "integrations", "delete_source_evidence")
         cls.integration = Integration.objects.create(
             name="Deletion source",
@@ -255,6 +258,50 @@ class EvidenceDeletionLookupRemediationTests(TestCase):
             cls.integration,
             "deletion-target",
             "asset",
+        )
+        cls.deleted_evidence = source_object(
+            cls.integration,
+            "deleted-list-target",
+            "asset",
+            deleted=True,
+        )
+        cls.later_evidence = source_object(
+            cls.integration,
+            "later-list-target",
+            "asset",
+        )
+
+    def _listed_ids(self, path):
+        api = APIClient()
+        api.force_authenticate(self.auditor)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            response = api.get(path)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            any(
+                issubclass(warning.category, UnorderedObjectListWarning)
+                for warning in caught
+            )
+        )
+        return [item["id"] for item in response.json()["results"]]
+
+    def test_normal_evidence_list_has_stable_id_ordering(self):
+        self.assertEqual(
+            self._listed_ids("/api/external-objects/"),
+            sorted((self.evidence.pk, self.later_evidence.pk)),
+        )
+
+    def test_include_deleted_evidence_list_has_stable_id_ordering(self):
+        self.assertEqual(
+            self._listed_ids("/api/external-objects/?include_deleted=true"),
+            sorted(
+                (
+                    self.evidence.pk,
+                    self.deleted_evidence.pk,
+                    self.later_evidence.pk,
+                )
+            ),
         )
 
     def test_deleted_and_nonexistent_evidence_ids_are_indistinguishable(self):

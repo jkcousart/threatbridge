@@ -197,7 +197,7 @@ class ExternalObjectViewSet(viewsets.ReadOnlyModelViewSet):
             queryset = queryset.filter(natural_key=natural_key)
         if projection_status:
             queryset = queryset.filter(projection_status=projection_status)
-        return queryset
+        return queryset.order_by("id")
 
     @action(detail=True, methods=["post"], url_path="delete-evidence")
     def delete_evidence(self, request, pk=None):
