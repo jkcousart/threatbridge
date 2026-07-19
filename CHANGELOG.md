@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Approved Apache-2.0 licensing and contributor guidance for public source distribution.
+- Added fully hashed build, runtime, and development dependency locks generated from
+  `pyproject.toml`, plus lock consistency and CycloneDX SBOM tooling.
+- Pinned the exact Python 3.13.14 slim Docker base to an immutable multi-platform manifest digest
+  and changed the image build to use locked dependencies and an isolated wheel builder.
+- Added full-SHA-pinned GitHub workflows for tests/security, CodeQL, dependency review, and SBOM
+  verification without publishing packages, images, or release artifacts.
+- Added supply-chain, provenance, signing, archive-safety, and public-release checklist guidance.
+- Made the installed wheel authoritative in the final image, excluded source/test/development
+  material, and added runtime import-path validation.
+- Separated hermetic committed-lock validation from scheduled/manual public-index freshness checks.
+- Added CPython 3.12/3.13/3.14 CI coverage and YAML 1.2-aware workflow-policy regression tests.
+- Added checksum-pinned Trivy image scanning, an operating-system-aware CycloneDX image SBOM, and
+  explicit high/critical blocking policy without suppressions or risk acceptance; exact-image
+  evidence is generated only in an ignored release-evidence directory.
+- Enforced exact workflow permissions and runtime/development lock parity for package versions and
+  compatible hashes.
+- Hardened the supported OpenCTI connector as a least-privilege, read-only MVP boundary and removed
+  Microsoft Defender from the registered adapter catalog for this release.
 - Replaced staff-based workflow authorization with centralized named permissions across browser,
   REST, services, management origins, and Django admin; removed HTTP Basic Authentication while
   retaining session CSRF protection.
@@ -15,8 +34,7 @@
   secret references, credential-free configuration validation, safe cursor handling, and hostile-file
   limits.
 - Added fail-closed production settings, generic readiness failures, and explicit proxy trust.
-- Added public governance and security documentation; license selection remains a publication
-  blocker.
+- Added public governance and security documentation.
 - Upgraded the development test dependency to a non-vulnerable pytest 9 release.
 - Replaced the static Django development key with a persistent, ignored, restrictively stored local secret while retaining production fail-closed behavior.
 - Prevented Docker builds from generating or retaining the local Django secret during `collectstatic`; builds now use a random command-scoped key and verify that `/app/.secrets` is absent.

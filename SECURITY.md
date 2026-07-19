@@ -7,14 +7,16 @@ or public release schedule has been established.
 
 ## Reporting a vulnerability
 
-Do not disclose suspected vulnerabilities, credentials, source records, or deployment details in
-a public issue. Before publication, the repository owner must configure and verify a private
-security-reporting channel, such as the hosting provider's private security-advisory feature.
+Use GitHub Private Vulnerability Reporting for this repository. From the
+repository, open **Security**, then **Advisories**, then
+**Report a vulnerability**.
 
-Until that channel is configured, stop and contact the repository owner through an independently
-verified private channel. Do not send secrets or complete evidence records in the initial report.
-Include only the affected version, impact, minimal reproduction steps, and whether exploitation is
-known.
+Do not disclose suspected vulnerabilities, credentials, source records, or
+deployment details in a public issue, discussion, pull request, or commit.
+
+Include the affected version, reproduction steps, expected impact, and any
+suggested remediation that can be shared safely. The maintainer will coordinate
+validation, remediation, disclosure, and credit through the private advisory.
 
 ## Response expectations
 

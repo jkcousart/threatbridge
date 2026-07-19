@@ -30,60 +30,8 @@ For scheduled synchronization:
 
 ```bash
 python manage.py sync_enabled_integrations
-python manage.py sync_integration defender-vulnerabilities
+python manage.py sync_integration opencti-reports
 ```
-
-## Microsoft Defender Vulnerability Management
-
-ThreatBridge supports two independent Defender profiles because each profile maintains its own cursor and normalized object type.
-
-### Vulnerability findings
-
-`integration.json`:
-
-```json
-{
-  "name": "Defender vulnerability findings",
-  "slug": "defender-vulnerabilities",
-  "kind": "vulnerability",
-  "adapter_path": "integrations.adapters.defender_vm.DefenderVmAdapter",
-  "enabled": true,
-  "configuration": {
-    "resource": "vulnerabilities",
-    "base_url": "https://api.security.microsoft.com",
-    "page_size": 50000,
-    "project_records": true
-  },
-  "secret_reference": "env://DEFENDER"
-}
-```
-
-### Software inventory
-
-Use a second profile and change `resource` to `software_inventory`:
-
-```json
-{
-  "name": "Defender software inventory",
-  "slug": "defender-software",
-  "kind": "asset",
-  "adapter_path": "integrations.adapters.defender_vm.DefenderVmAdapter",
-  "enabled": true,
-  "configuration": {
-    "resource": "software_inventory",
-    "base_url": "https://api.security.microsoft.com",
-    "page_size": 50000,
-    "project_records": true
-  },
-  "secret_reference": "env://DEFENDER"
-}
-```
-
-Have the deployment's secret provider inject `DEFENDER_TENANT_ID`, `DEFENDER_CLIENT_ID`, and
-`DEFENDER_CLIENT_SECRET` into the ThreatBridge process. Do not type or store their values in shell
-commands, checked-in files, or integration configuration.
-
-The Entra application should receive only the read permissions required for the selected feeds. The current adapter uses the paged `SoftwareInventoryByMachine` and `SoftwareVulnerabilitiesByMachine` endpoints. For very large estates, add a bulk-export adapter before production rollout rather than raising page guardrails indefinitely.
 
 ## OpenCTI
 
@@ -97,14 +45,39 @@ The Entra application should receive only the read permissions required for the 
   "configuration": {
     "base_url": "https://opencti.example.invalid",
     "page_size": 100,
+    "timeout_seconds": 60,
+    "max_batches_per_sync": 50,
     "project_records": true
   },
   "secret_reference": "env://OPENCTI"
 }
 ```
 
-Have the deployment's secret provider inject `OPENCTI_TOKEN` into the ThreatBridge process. Do not
-place the token in source files, shell history, process arguments, or integration configuration.
+Create a dedicated OpenCTI user for ThreatBridge and issue an API token for that user. The user must
+not be an administrator or have bypass capabilities. Grant only the read permissions needed for
+reports, markings, and the linked ATT&CK-pattern and vulnerability objects selected by the query.
+The OpenCTI API grants the token the privileges of its associated user; administrator tokens are
+outside the supported MVP boundary.
+
+Have the deployment's secret provider inject `OPENCTI_TOKEN` and use
+`secret_reference=env:OPENCTI_TOKEN` or `env://OPENCTI`. Alternatively, mount the token in a
+non-symlink regular file readable only by the ThreatBridge account (mode `0600`) and use an absolute
+reference such as `file:/run/secrets/opencti-token`. Secret files are limited to 64 KiB. Do not
+place the token in source files, shell history, process arguments, integration configuration, the
+base URL, logs, errors, database fields, synchronization cursors, or audit-event metadata.
+
+ThreatBridge sends outbound requests to the explicitly configured OpenCTI base URL; it does not
+require inbound OpenCTI callbacks. Production mode requires HTTPS and verifies the server TLS
+certificate and hostname. The GraphQL endpoint defaults to `BASE_URL/graphql`; an override must
+retain the same scheme, normalized hostname, and effective port. Proxies are disabled. Redirects
+must remain same-origin and every redirect is revalidated against the outbound-host, DNS, and
+private-CIDR policy.
+
+The OpenCTI timeout is restricted to 1–120 seconds and page size to 1–500 records. Synchronization
+also enforces `THREATBRIDGE_MAX_PAGES_PER_SYNC` and
+`THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES`; keep these at bounded deployment-reviewed values. Invalid
+JSON, malformed GraphQL connection shapes, and GraphQL error payloads fail with generic connector
+errors rather than storing or returning vendor text.
 
 The built-in GraphQL query imports reports, markings, linked ATT&CK patterns, and linked CVEs.
 OpenCTI schemas can differ by release and extensions; set `configuration.query` to a
@@ -113,6 +86,24 @@ deployment-tested GraphQL query when an instance does not accept the default sel
 All imported ATT&CK report mappings begin pending regardless of connector payload or configuration.
 Approval and rejection require `catalog.review_attack_mapping` and create append-only review and
 security events.
+
+The built-in operation is read-only: it executes a GraphQL `query` and imports results. It does not
+modify or delete OpenCTI objects, perform enrichment write-back, invoke export actions, or send
+assessment results back to OpenCTI. Custom GraphQL text must remain a read query; operators must
+review it before configuration.
+
+For rotation, disable the integration, issue a replacement token for the same least-privileged
+service account, update the environment or secret file, restart the ThreatBridge process so it
+reloads the secret, test the integration, and then revoke the old token. Revoke a suspected exposed
+token immediately in OpenCTI before investigating the ThreatBridge host.
+
+## Microsoft Defender is deferred
+
+Microsoft Defender is not an MVP integration and no Defender adapter is registered in this
+release. Adding it would materially expand the trust boundary to production incidents, devices,
+users, tenant telemetry, Entra application credentials, and potentially response actions. It
+requires a separate design and security review; this release performs no Defender reads, writes,
+remediation, or response actions.
 
 ## MITRE ATT&CK STIX
 
@@ -227,7 +218,7 @@ implemented here.
 Production deployments must set `THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS` to the exact API hosts used by configured connectors:
 
 ```bash
-THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=api.security.microsoft.com,login.microsoftonline.com,opencti.example.invalid
+THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=opencti.example.invalid
 ```
 
 Plain HTTP connector URLs are rejected when `DJANGO_DEBUG=false`.
@@ -267,6 +258,10 @@ a `token` key. Its value must not be entered in a command line or committed conf
 env://PREFIX
 ```
 
-All variables beginning with `PREFIX_` are returned to the adapter as lowercase keys. For example, `DEFENDER_CLIENT_ID` becomes `client_id`.
+All variables beginning with `PREFIX_` are returned to the adapter as lowercase keys. For example,
+`OPENCTI_TOKEN` becomes `token` for `secret_reference=env://OPENCTI`.
+
+An absolute `file:/path` reference reads a regular, non-symlink UTF-8 file that grants no group or
+other permissions. The file may contain a plain value or a JSON object such as `{"token":"..."}`.
 
 For production, replace the environment resolver with a managed secret provider while preserving the `secret_reference` contract.

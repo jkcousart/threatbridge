@@ -44,6 +44,27 @@ python manage.py check --deploy
 The generated key is command-scoped and not printed. The database URL is synthetic and contains no
 password; the check does not connect to it.
 
+## OpenCTI MVP boundary
+
+The supported live connector boundary is a read-only outbound OpenCTI connection. Configure an
+exact HTTPS base URL and outbound-host allowlist entry; privately hosted OpenCTI also requires an
+explicit private CIDR covering every DNS answer. Keep TLS verification enabled and do not configure
+a proxy. ThreatBridge revalidates DNS at connection time, pins the connection to a validated
+address, preserves TLS verification against the original hostname, and rejects cross-origin
+redirects.
+
+Use a dedicated non-administrator OpenCTI user with only the minimum report, marking, ATT&CK, and
+vulnerability read permissions needed by the reviewed GraphQL query. Supply its API token through
+an environment reference or a non-symlink absolute secret file readable only by the ThreatBridge
+account. Never place it in the integration JSON, database, URL, logs, audit metadata, or command
+line. Keep the configured timeout, page size, maximum pages per sync, and maximum response bytes
+bounded. Rotation and revocation steps are documented in
+[`integration-setup.md`](integration-setup.md).
+
+Microsoft Defender is outside this MVP. Its production incidents, devices, users, tenant telemetry,
+Entra credentials, and potential response actions require a separate trust-boundary review; no
+Defender adapter is registered or supported here.
+
 ## Operational requirements
 
 Use a managed secret provider, TLS-terminating reverse proxy, supported PostgreSQL service,
@@ -51,6 +72,8 @@ encrypted backups with restore tests, centralized logs, restricted data-volume p
 malware scanning/quarantine, retention procedures, and monitored asynchronous workers before
 production use. Health responses disclose no debug details; readiness failures are generic.
 
-Dependency locking, software-bill-of-materials generation, signed artifacts, immutable base-image
-digest pinning, and verified CI action SHAs remain supply-chain work. Current builds are not fully
-reproducible.
+Hashed build/runtime/development locks, CycloneDX SBOM generation, immutable base-image digest
+pinning, and full-SHA-pinned CI actions are part of the release candidate. They reduce dependency
+drift but do not make builds bit-for-bit reproducible across runner images or platforms. Release
+signing, provenance attestations, runner-image pinning, and independent verification of all build
+inputs remain publication work; see [`supply-chain.md`](supply-chain.md).

@@ -13,7 +13,6 @@ BUILTIN_ADAPTERS = [
     "integrations.adapters.csv_inventory.CsvInventoryAdapter",
     "integrations.adapters.json_file.JsonFileAdapter",
     "integrations.adapters.mitre_attack.MitreAttackStixAdapter",
-    "integrations.adapters.defender_vm.DefenderVmAdapter",
     "integrations.adapters.opencti.OpenCtiReportsAdapter",
     "integrations.adapters.trivy.TrivyJsonAdapter",
 ]

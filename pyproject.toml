@@ -7,7 +7,15 @@ name = "threatbridge"
 version = "0.3.0"
 description = "Threat-informed integration, evidence, and control-correlation platform"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
 dependencies = [
   "Django>=5.2,<7",
   "djangorestframework>=3.15,<4",
@@ -19,6 +27,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "bandit>=1.9,<2",
+  "cyclonedx-bom>=7.3,<8",
+  "pip-audit>=2.10,<3",
+  "pip-tools>=7.6,<8",
+  "PyYAML>=6,<7",
   "pytest>=9.0.3,<10",
   "pytest-django>=4.9,<5",
   "ruff>=0.9,<1",
@@ -29,6 +42,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["threatbridge*", "integrations*", "catalog*"]
+exclude = ["*.tests", "*.tests.*"]
 
 [tool.setuptools.package-data]
 catalog = ["templates/**/*.html", "static/**/*"]

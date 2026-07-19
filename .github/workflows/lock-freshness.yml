@@ -1,0 +1,41 @@
+name: Dependency lock freshness
+
+on:
+  schedule:
+    - cron: "17 8 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-lock-freshness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PIP_CONFIG_FILE: /dev/null
+      PIP_EXTRA_INDEX_URL: ""
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: 3.14.4
+          cache: pip
+          cache-dependency-path: |
+            requirements/build.txt
+            requirements/development.txt
+      - name: Install committed lock tooling
+        run: |
+          python -m pip install --require-hashes -r requirements/build.txt
+          python -m pip install --require-hashes -r requirements/development.txt
+      - name: Re-resolve and compare without modifying the repository
+        run: ./scripts/check_dependency_locks.sh

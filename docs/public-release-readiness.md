@@ -1,6 +1,24 @@
 # Public release readiness
 
-ThreatBridge is not yet ready for publication or production deployment.
+The source candidate completed technical and owner review and is authorized for
+public source publication. Prebuilt container publication remains blocked by
+the unresolved High and Critical findings documented in
+`release-validation.md`.
+
+## Release preparation present
+
+- Canonical Apache-2.0 text, notice, package metadata, and contribution references are prepared,
+  approved by the project owner.
+- Hashed build, runtime, and development locks are generated from `pyproject.toml`.
+- The exact Python 3.13.14 slim Docker base is pinned to an immutable manifest digest.
+- GitHub test/security, CodeQL, dependency-review, and SBOM workflows use verified full action
+  SHAs, minimal permissions, explicit timeouts, and concurrency controls.
+- A reproducible CycloneDX runtime SBOM and supply-chain verification guidance are included.
+- The wheel-authoritative image has reproducible local operating-system-aware CycloneDX SBOM
+  generation and a pinned, unsuppressed Trivy validation procedure. Digest-bound image evidence is
+  retained only in the ignored release-evidence directory.
+- A public-release checklist covers history, archive, private-file, legal, scan, and provenance
+  review.
 
 ## Phase 1 controls present
 
@@ -14,19 +32,23 @@ ThreatBridge is not yet ready for publication or production deployment.
 - Fail-closed production settings and generic readiness failures.
 - SSRF, DNS-pinning, same-origin redirect, TLS-hostname, private-CIDR, and proxy controls.
 
-## Publication blockers
+## Source-repository publication blockers
 
-- Select and review a license; this repository intentionally contains no license.
-- Replace placeholder CODEOWNERS teams with verified repository identities.
-- Configure and test a private vulnerability and conduct reporting channel.
-- Independently verify immutable commit SHAs before adding any CI workflow actions.
-- Lock dependencies, pin base images by digest, produce an SBOM, and define update ownership.
-- Complete legal, privacy, trademark, export, data-retention, and sample-data review.
-- Perform an independent security review and clean-environment release rehearsal.
+- Complete: the project owner approved Apache-2.0 selection, copyright and notice text, contribution terms, and public source distribution.
+- Complete: CODEOWNERS uses the verified public repository owner `@jkcousart`.
+- Complete: GitHub Private Vulnerability Reporting was selected for activation at publication, and the owner verified the dedicated private conduct mailbox.
+- Independently review this complete preparation change set and run the workflows on the intended
+  public host; local validation cannot prove hosted permissions or feature availability.
+- Re-resolve package, action, and base-image provenance immediately before release.
+- Complete a clean-environment release rehearsal from the intended signed tag.
 
-Dependabot configuration describes intended update checks but has not run. No GitHub Actions
-workflow is included because immutable third-party action SHAs were not independently verified in
-this environment.
+The current container findings do not block publication of reviewed source. They do block a
+prebuilt container artifact, and no risk was accepted or suppressed. Signing and attestations are
+future work, not an MVP source-repository requirement.
+
+Dependabot configuration describes intended update checks but has not run. Workflows are prepared
+but have not run on GitHub, and no artifact, package, image, signature, or release has been
+published.
 
 ## Deferred product work
 

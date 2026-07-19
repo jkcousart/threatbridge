@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
@@ -44,20 +46,63 @@ CURSOR_SECRET_KEYS = CONFIGURATION_SECRET_KEYS | {
     "signature",
     "sig",
 }
+MAX_SECRET_FILE_BYTES = 64 * 1024
+
+
+def _parsed_secret_value(raw: str) -> Mapping[str, Any]:
+    value = raw.strip()
+    if not value:
+        raise ValueError("Secret value is empty")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {"value": value}
+    if isinstance(parsed, Mapping):
+        return dict(parsed)
+    return {"value": parsed}
+
+
+def _read_secret_file(reference: str) -> Mapping[str, Any]:
+    path = Path(reference.removeprefix("file:").strip())
+    if not path.is_absolute():
+        raise ValueError("Secret file reference must use an absolute path")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise ValueError("Secret file could not be opened") from None
+    with os.fdopen(descriptor, "rb") as secret_file:
+        file_status = os.fstat(secret_file.fileno())
+        if not stat.S_ISREG(file_status.st_mode):
+            raise ValueError("Secret file must be a regular file")
+        if stat.S_IMODE(file_status.st_mode) & 0o077:
+            raise ValueError("Secret file must not grant group or other permissions")
+        payload = secret_file.read(MAX_SECRET_FILE_BYTES + 1)
+    if len(payload) > MAX_SECRET_FILE_BYTES:
+        raise ValueError("Secret file exceeds the configured safety limit")
+    try:
+        return _parsed_secret_value(payload.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise ValueError("Secret file must contain UTF-8 text") from None
 
 
 def resolve_secret_reference(reference: str) -> Mapping[str, Any]:
-    """Resolve environment-backed secrets without persisting their values.
+    """Resolve environment- or file-backed secrets without persisting values.
 
     ``env:VARIABLE`` reads one variable. Its value may be a JSON object or a
     plain string. ``env://PREFIX`` reads all variables beginning with
-    ``PREFIX_`` and returns lower-case keys, so ``DEFENDER_CLIENT_ID`` becomes
-    ``client_id``. Vault or cloud-secret implementations can replace this
-    function later without changing the adapter contract.
+    ``PREFIX_`` and returns lower-case keys, so ``OPENCTI_TOKEN`` becomes
+    ``token``. ``file:/absolute/path`` reads a non-symlink regular file
+    whose mode grants no group or other permissions. Vault or cloud-secret
+    implementations can replace this function later without changing the
+    adapter contract.
     """
 
     if not reference:
         return {}
+
+    if reference.startswith("file:"):
+        return _read_secret_file(reference)
 
     if reference.startswith("env://"):
         prefix = reference.removeprefix("env://").strip().upper().rstrip("_")
@@ -74,20 +119,17 @@ def resolve_secret_reference(reference: str) -> Mapping[str, Any]:
         return values
 
     if not reference.startswith("env:"):
-        raise ValueError("Unsupported secret reference. Use env:VARIABLE or env://PREFIX")
+        raise ValueError(
+            "Unsupported secret reference. Use env:VARIABLE, env://PREFIX, "
+            "or file:/absolute/path"
+        )
     variable = reference.removeprefix("env:").strip()
     if not variable:
         raise ValueError("Secret environment variable name is empty")
     raw = os.getenv(variable)
     if raw is None:
         raise ValueError(f"Secret environment variable {variable} is not set")
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"value": raw}
-    if isinstance(parsed, Mapping):
-        return dict(parsed)
-    return {"value": parsed}
+    return _parsed_secret_value(raw)
 
 
 def safe_excerpt(value: Any, *, max_text: int = 500, depth: int = 0) -> Any:

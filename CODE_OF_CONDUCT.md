@@ -7,6 +7,7 @@ feedback, respecting privacy, and avoiding disclosure of confidential or securit
 Harassment, discriminatory conduct, threats, doxxing, deliberate disruption, and publication of
 private vulnerability details are not acceptable.
 
-Before public contribution intake opens, maintainers must designate and verify a private conduct
-reporting channel. Until then, do not place sensitive conduct reports in public issues. Maintainers
-may remove content or restrict participation to protect contributors and the project.
+Send private conduct reports to `threatbridge.conduct@proton.me`. Do not place sensitive
+conduct reports, personal information, or private vulnerability details in
+public issues or discussions. The project maintainer will acknowledge and
+review reports privately.

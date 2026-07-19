@@ -2,8 +2,10 @@
 
 ThreatBridge is a vendor-neutral, threat-informed evidence and correlation application. It imports threat intelligence, asset inventory, software, vulnerability findings, detections, telemetry, and validation results; stores the latest hashed source record with provenance; then produces explainable threat-to-control gap assessments.
 
-This repository is a runnable single-deployment MVP, not a production-ready or public-release-ready
-system. It is intentionally read-only toward external security products.
+ThreatBridge is not a control-plane or response-automation system. It is
+intentionally read-only toward external security products. ThreatBridge is
+licensed under Apache-2.0, as approved by the project owner for public source
+distribution.
 
 ## What is included
 
@@ -20,7 +22,6 @@ system. It is intentionally read-only toward external security products.
 - Reusable file-import profiles and a command-line import workflow
 - Built-in adapters for:
   - MITRE ATT&CK STIX
-  - Microsoft Defender Vulnerability Management
   - OpenCTI reports
   - Trivy JSON reports
   - Generic CSV
@@ -30,12 +31,14 @@ system. It is intentionally read-only toward external security products.
 
 ## Quick start
 
-Requires Python 3.12 or newer.
+Requires CPython 3.12, 3.13, or 3.14.
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e '.[dev]'
+python -m pip install --require-hashes -r requirements/build.txt
+python -m pip install --require-hashes -r requirements/development.txt
+python -m pip install --no-deps --no-build-isolation -e .
 cp .env.example .env
 python manage.py migrate
 python manage.py seed_demo
@@ -44,6 +47,10 @@ python manage.py runserver
 ```
 
 Open `http://127.0.0.1:8000/`, sign in, and inspect the seeded report and assessment.
+
+The lock files are generated from `pyproject.toml`; do not edit them by hand. See
+[`docs/dependency-locking.md`](docs/dependency-locking.md) for installation, consistency checks,
+and the controlled update procedure.
 
 Useful routes:
 
@@ -288,7 +295,10 @@ class IntegrationAdapter:
     def normalize(self, context, raw_record): ...
 ```
 
-See [`docs/integration-contract.md`](docs/integration-contract.md) for the adapter contract and [`docs/integration-setup.md`](docs/integration-setup.md) for Defender, OpenCTI, MITRE ATT&CK, Trivy, and scheduled file-import examples.
+See [`docs/integration-contract.md`](docs/integration-contract.md) for the adapter contract and
+[`docs/integration-setup.md`](docs/integration-setup.md) for the supported OpenCTI MVP boundary,
+MITRE ATT&CK, Trivy, and scheduled file-import examples. Microsoft Defender is explicitly deferred
+from this release.
 
 ## Environment variables
 
@@ -360,3 +370,17 @@ A clean smoke test can also be run with:
 python manage.py migrate
 python manage.py seed_demo
 ```
+
+## Licence
+
+ThreatBridge is prepared for distribution under the
+[Apache License, Version 2.0](LICENSE). Copyright 2026 ThreatBridge contributors. See
+[`NOTICE`](NOTICE) for the project notice.
+
+The project owner approved the license selection, copyright attribution,
+project name, notices, contribution terms, and public source distribution.
+Prebuilt container publication remains subject to the image vulnerability
+policy documented in `docs/container-image-security.md`.
+
+Container artifact provenance, image SBOM generation, and vulnerability-disposition policy are
+documented in [`docs/container-image-security.md`](docs/container-image-security.md).

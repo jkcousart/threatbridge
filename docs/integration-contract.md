@@ -189,32 +189,34 @@ No change to the core synchronization service is required.
 
 ## Secret references
 
-`Integration.secret_reference` stores only a lookup reference. The built-in environment provider uses a reference such as:
+`Integration.secret_reference` stores only a lookup reference. The built-in environment provider
+uses a reference such as:
 
 ```text
-env://DEFENDER
+env://OPENCTI
 ```
 
 and resolves variables such as:
 
 ```text
-DEFENDER_TENANT_ID
-DEFENDER_CLIENT_ID
-DEFENDER_CLIENT_SECRET
+OPENCTI_TOKEN
 ```
 
-Production deployments should replace or extend this resolver with an enterprise secret manager and short-lived credentials where supported.
+Production deployments may use an environment reference or an absolute, restrictive
+`file:/run/secrets/...` reference. A managed secret provider may replace or extend this resolver
+without changing the adapter contract.
 
 ## Current connector sequence
 
 1. MITRE ATT&CK STIX import
-2. Microsoft Defender Vulnerability Management inventory and vulnerability API
-3. OpenCTI GraphQL reports and relationships
-4. Trivy JSON imports
-5. Generic CSV / JSON exports
-6. Greenbone GMP reports
-7. Securonix detections and alerts
-8. CMDB or ServiceNow business-service mapping
-9. ThreatWise or generic detection-validation results
+2. OpenCTI GraphQL reports and relationships
+3. Trivy JSON imports
+4. Generic CSV / JSON exports
+5. Greenbone GMP reports
+6. SIEM detections and alerts
+7. CMDB business-service mapping
+8. Generic detection-validation results
 
-The MVP includes working adapter entry points for items 1–5. Items 6–9 use the same contract and can be added without altering the source-evidence or assessment layers.
+The MVP includes working adapter entry points for items 1–4. Later items use the same contract and
+require their own design and security review. Microsoft Defender is specifically deferred because
+its tenant telemetry and possible response-action boundary is outside this release.
