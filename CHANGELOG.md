@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed GitHub-hosted workflow portability by invoking workflow validation through Python and resolving SBOM tools from either the configured virtual environment or the runner PATH.
 - Approved Apache-2.0 licensing and contributor guidance for public source distribution.
 - Added fully hashed build, runtime, and development dependency locks generated from
   `pyproject.toml`, plus lock consistency and CycloneDX SBOM tooling.
