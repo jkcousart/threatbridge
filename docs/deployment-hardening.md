@@ -7,10 +7,10 @@ settings contract; it is not a deployment certification.
 
 When `DJANGO_DEBUG=false`, startup requires:
 
-- an explicit `DJANGO_SECRET_KEY`;
+- an explicit `DJANGO_SECRET_KEY` or `DJANGO_SECRET_KEY_FILE`;
 - exact, non-wildcard `DJANGO_ALLOWED_HOSTS`;
 - explicit HTTPS `DJANGO_CSRF_TRUSTED_ORIGINS`;
-- an explicit PostgreSQL `DATABASE_URL`;
+- an explicit PostgreSQL `DATABASE_URL` or `DATABASE_URL_FILE`;
 - an exact `THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS` policy; and
 - an explicit non-negative `DJANGO_SECURE_HSTS_SECONDS`.
 
@@ -44,6 +44,39 @@ python manage.py check --deploy
 The generated key is command-scoped and not printed. The database URL is synthetic and contains no
 password; the check does not connect to it.
 
+
+## Production Compose profile
+
+`compose.production.yml` is the supported deployment starting point. The local `compose.yml` is
+not a production profile. The production profile:
+
+- builds from separately configurable builder and runtime image digests;
+- supports the shell-free Docker Hardened Images Python runtime;
+- runs as numeric UID/GID `65532:65532`;
+- installs and executes the reviewed wheel from a runtime-only virtual environment under
+  `/opt/runtime-venv`, without build tooling or `pip`;
+- loads the Django key and database URL from Docker secret files;
+- runs migrations in a one-shot service before starting Gunicorn;
+- gives PostgreSQL no published port and places it on an internal network;
+- drops all Linux capabilities from application services, enables `no-new-privileges`, and uses a
+  read-only root filesystem with a bounded `/tmp` tmpfs; and
+- publishes the application only on an explicitly configured host address and port.
+
+Generate local secret material with `scripts/prepare_production_deployment.py`, authenticate to
+`dhi.io`, and resolve the discovery tags to immutable manifest digests with
+`scripts/resolve_production_images.sh`. The resolver deliberately updates only the three image
+references. It does not deploy, publish, suppress findings, or accept risk.
+
+The application accepts `DJANGO_SECRET_KEY_FILE` and `DATABASE_URL_FILE` only as absolute, regular,
+non-symlink files that are not group- or world-writable. Direct and file-backed forms are mutually
+exclusive. Connector tokens continue to use each integration's existing `secret_reference`
+contract.
+
+An optional `compose.production.step-ca.yml` overlay mounts one reviewed internal CA certificate and
+sets `THREATBRIDGE_EXTRA_CA_FILE`. The outbound client starts from Python's default TLS context and
+adds that certificate with `load_verify_locations`; it does not disable hostname verification or
+replace public trust.
+
 ## OpenCTI MVP boundary
 
 The supported live connector boundary is a read-only outbound OpenCTI connection. Configure an
@@ -69,8 +102,10 @@ Defender adapter is registered or supported here.
 
 Use a managed secret provider, TLS-terminating reverse proxy, supported PostgreSQL service,
 encrypted backups with restore tests, centralized logs, restricted data-volume permissions,
-malware scanning/quarantine, retention procedures, and monitored asynchronous workers before
-production use. Health responses disclose no debug details; readiness failures are generic.
+malware scanning/quarantine, and retention procedures before production use. The current
+management-command scheduler does not require an asynchronous worker; add one only after a separate
+trust-boundary and authorization review. Health responses disclose no debug details; readiness
+failures are generic.
 
 Hashed build/runtime/development locks, CycloneDX SBOM generation, immutable base-image digest
 pinning, and full-SHA-pinned CI actions are part of the release candidate. They reduce dependency

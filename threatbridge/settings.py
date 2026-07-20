@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import stat
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -12,6 +13,63 @@ from django.core.exceptions import ImproperlyConfigured
 from threatbridge.startup_audit import record_production_configuration_failure
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _configured_value(name: str) -> str | None:
+    direct_value = os.getenv(name)
+    file_name = os.getenv(f"{name}_FILE")
+    if direct_value and file_name:
+        raise ImproperlyConfigured(
+            f"Set only one of {name} or {name}_FILE"
+        )
+    if direct_value:
+        return direct_value
+    if not file_name:
+        return None
+
+    path = Path(file_name)
+    if not path.is_absolute():
+        raise ImproperlyConfigured(f"{name}_FILE must be an absolute path")
+    try:
+        if path.is_symlink():
+            raise ImproperlyConfigured(f"{name}_FILE must not be a symlink")
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ImproperlyConfigured(f"{name}_FILE must be a regular file")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ImproperlyConfigured(
+                f"{name}_FILE must not be group- or world-writable"
+            )
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ImproperlyConfigured(f"Unable to read {name}_FILE") from exc
+    if not value:
+        raise ImproperlyConfigured(f"{name}_FILE must not be empty")
+    return value
+
+
+
+
+def _configured_file_path(name: str) -> str | None:
+    file_name = os.getenv(name)
+    if not file_name:
+        return None
+    path = Path(file_name)
+    if not path.is_absolute():
+        raise ImproperlyConfigured(f"{name} must be an absolute path")
+    try:
+        if path.is_symlink():
+            raise ImproperlyConfigured(f"{name} must not be a symlink")
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ImproperlyConfigured(f"{name} must be a regular file")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ImproperlyConfigured(
+                f"{name} must not be group- or world-writable"
+            )
+    except OSError as exc:
+        raise ImproperlyConfigured(f"Unable to read {name}") from exc
+    return str(path)
 
 
 def _environment_boolean(name: str, default: bool = False) -> bool:
@@ -59,7 +117,7 @@ def _secret_key(*, debug: bool, configured_secret: str | None, local_path: Path)
 
 SECRET_KEY = _secret_key(
     debug=DEBUG,
-    configured_secret=os.getenv("DJANGO_SECRET_KEY"),
+    configured_secret=_configured_value("DJANGO_SECRET_KEY"),
     local_path=BASE_DIR / ".secrets" / "django-secret-key",
 )
 
@@ -74,7 +132,7 @@ CSRF_TRUSTED_ORIGINS = [
     if value.strip()
 ]
 
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'db.sqlite3'}")
+DATABASE_URL = _configured_value("DATABASE_URL") or f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
 
 
 def _is_exact_https_origin(value: str) -> bool:
@@ -146,7 +204,7 @@ def _validate_production_configuration() -> None:
         raise ImproperlyConfigured(
             "DJANGO_CSRF_TRUSTED_ORIGINS must contain explicit HTTPS origins in production"
         )
-    configured_database = os.getenv("DATABASE_URL")
+    configured_database = _configured_value("DATABASE_URL")
     database_url = urlsplit(configured_database or "")
     if (
         not configured_database
@@ -292,6 +350,7 @@ THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS = tuple(
     for value in os.getenv("THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS", "").split(",")
     if value.strip()
 )
+THREATBRIDGE_EXTRA_CA_FILE = _configured_file_path("THREATBRIDGE_EXTRA_CA_FILE")
 
 X_FRAME_OPTIONS = "DENY"
 SECURE_CONTENT_TYPE_NOSNIFF = True

@@ -20,6 +20,9 @@ venv
 .env
 .env.*
 .secrets
+deploy/.env.production
+deploy/secrets
+deploy/ca
 
 # Databases and runtime data
 **/*.sqlite3
@@ -55,6 +58,7 @@ docs/security/private-*
 **/*.tar.gz
 **/*.tgz
 **/*.log
+backups
 
 # Packaging metadata and build output
 *.egg-info

@@ -66,17 +66,22 @@ Useful routes:
 
 ## Docker Compose
 
+The default Compose file remains a local-development stack:
+
 ```bash
 docker compose up --build -d
 docker compose exec web python manage.py createsuperuser
 docker compose exec web python manage.py seed_demo
 ```
 
-Then open `http://127.0.0.1:8000/`.
+Then open `http://127.0.0.1:8000/`. Development mode generates a persistent local Django secret
+inside the container and uses intentionally local database credentials. Do not expose this profile.
 
-The Compose values are for local evaluation only. Development mode generates a persistent local
-Django secret inside the container. Before using a shared environment, replace the database
-password, set `DJANGO_DEBUG=false`, and provide `DJANGO_SECRET_KEY` explicitly.
+For a shared or homelab deployment, use `compose.production.yml`. It provides a shell-free non-root
+application image, immutable image inputs, file-backed secrets, a one-shot migration service, an
+internal-only PostgreSQL network, read-only application containers, health checks, backup/restore
+helpers, and port `8020` for a restricted reverse-proxy path. See
+[`deploy/README.md`](deploy/README.md) for the complete procedure.
 
 ## Importing CSV and JSON
 
@@ -305,13 +310,15 @@ from this release.
 | Variable | Purpose | Default |
 |---|---|---|
 | `DJANGO_DEBUG` | Development mode | `true` |
-| `DJANGO_SECRET_KEY` | Django signing key; required outside development | Generated in `.secrets/` during development |
+| `DJANGO_SECRET_KEY` | Django signing key; required outside development unless its file form is used | Generated in `.secrets/` during development |
+| `DJANGO_SECRET_KEY_FILE` | Absolute non-symlink file containing the Django signing key | Empty |
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated hosts | `localhost,127.0.0.1` |
 | `DJANGO_CSRF_TRUSTED_ORIGINS` | Comma-separated origins | Empty |
 | `DJANGO_SECURE_HSTS_SECONDS` | Explicit production HSTS duration | Required in production |
 | `DJANGO_TRUST_X_FORWARDED_PROTO` | Trust a stripping proxy's forwarded HTTPS header | `false` |
 | `DJANGO_TIME_ZONE` | Display/default timezone | `UTC` |
-| `DATABASE_URL` | SQLite or PostgreSQL connection | Local SQLite |
+| `DATABASE_URL` | SQLite or PostgreSQL connection; mutually exclusive with its file form | Local SQLite |
+| `DATABASE_URL_FILE` | Absolute non-symlink file containing the database URL | Empty |
 | `THREATBRIDGE_DATA_DIR` | Connector and upload data directory | `./data` |
 | `THREATBRIDGE_MAX_UPLOAD_BYTES` | Multipart file-size limit | `52428800` |
 | `THREATBRIDGE_MAX_IMPORT_RECORDS` | Records allowed in one file import | `100000` |
@@ -329,6 +336,7 @@ from this release.
 | `THREATBRIDGE_ALLOWED_ADAPTER_PREFIXES` | Allowed Python adapter namespaces | `integrations.adapters.` |
 | `THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS` | Exact connector destination hostnames or IP literals | Empty |
 | `THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS` | Private CIDRs permitted for exact allowlisted hosts | Empty |
+| `THREATBRIDGE_EXTRA_CA_FILE` | Additional reviewed CA certificate added to the default TLS trust store | Empty |
 
 ## Security boundaries
 

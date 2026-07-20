@@ -256,13 +256,21 @@ def test_development_lock_retains_runtime_artifact_hashes(tmp_path: Path) -> Non
 
 def test_docker_final_stage_uses_only_the_installed_wheel() -> None:
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    stages = dockerfile.split("\nFROM ")
-    assert len(stages) == 2
-    final_stage = stages[1]
+    assert "ARG PYTHON_BUILDER_IMAGE=" in dockerfile
+    assert "ARG PYTHON_RUNTIME_IMAGE=" in dockerfile
+    marker = "FROM ${PYTHON_RUNTIME_IMAGE} AS runtime"
+    assert marker in dockerfile
+    final_stage = dockerfile.split(marker, 1)[1]
     assert "COPY . ." not in final_stage
-    assert "COPY manage.py LICENSE NOTICE /app/" in final_stage
-    assert "test ! -e /app/threatbridge" in final_stage
-    assert "sysconfig.get_paths()" in final_stage
+    assert (
+        "COPY --from=builder --chown=65532:65532 "
+        "/opt/runtime-venv /opt/runtime-venv"
+    ) in final_stage
+    assert "COPY --from=builder --chown=65532:65532 /runtime/app /app" in final_stage
+    assert "USER 65532:65532" in final_stage
+    assert "ENTRYPOINT []" in final_stage
+    assert "\nRUN " not in final_stage
+    assert "sysconfig.get_paths()" in dockerfile
 
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'exclude = ["*.tests", "*.tests.*"]' in pyproject

@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import socket
+import ssl
 from urllib.parse import ParseResult, urlparse
 from urllib.request import (
     HTTPHandler,
@@ -253,6 +254,16 @@ class _PinnedHttpsConnection(http.client.HTTPSConnection):
         self._create_connection = _create_allowed_connection
 
 
+
+
+def _build_tls_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    extra_ca_file = getattr(settings, "THREATBRIDGE_EXTRA_CA_FILE", None)
+    if extra_ca_file:
+        context.load_verify_locations(cafile=extra_ca_file)
+    return context
+
+
 class _PinnedHttpHandler(HTTPHandler):
     def http_open(self, request):
         return self.do_open(_PinnedHttpConnection, request)
@@ -276,7 +287,7 @@ def open_outbound_request(request: Request, *, timeout: int):
     opener = build_opener(
         ProxyHandler({}),
         _PinnedHttpHandler(),
-        _PinnedHttpsHandler(),
+        _PinnedHttpsHandler(context=_build_tls_context()),
         _ValidatedRedirectHandler(),
     )
     return opener.open(request, timeout=timeout)

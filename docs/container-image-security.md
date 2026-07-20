@@ -71,3 +71,20 @@ release evidence. The complete Trivy report itself remains unsuppressed and sepa
   publication blockers under this preparation policy.
 
 There are no suppressions or accepted risks in the current candidate.
+
+## Hardened base comparison
+
+The Dockerfile accepts `PYTHON_BUILDER_IMAGE` and `PYTHON_RUNTIME_IMAGE` build arguments. Separate
+build and runtime virtual environments prevent build tooling from entering the final image; `pip`
+is removed from the copied runtime environment after the locked installation is checked. The final
+stage performs no shell command and runs as UID/GID `65532:65532`, allowing the same application
+artifact to be evaluated against a shell-free hardened runtime. Production configuration resolves
+`dhi.io/python:3.13-dev` and `dhi.io/python:3.13` to immutable manifest digests before building.
+The mutable tags are discovery inputs only and must not remain in the deployed environment file.
+
+Use `scripts/compare_base_images.sh` to build and validate both the recorded Docker Official Image
+baseline and the resolved hardened candidate. When Trivy is installed at the approved path, the
+script retains an unsuppressed report for each exact image. It records evidence but never chooses a
+base or changes the finding policy. A candidate is acceptable only after application checks,
+PostgreSQL migrations, readiness, connector TLS behavior, runtime permissions, backup/restore, and
+all exact-image findings are reviewed.

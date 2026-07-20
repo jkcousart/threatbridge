@@ -1,0 +1,16 @@
+services:
+  migrate:
+    environment:
+      THREATBRIDGE_EXTRA_CA_FILE: /run/configs/threatbridge_extra_ca
+    configs:
+      - threatbridge_extra_ca
+
+  web:
+    environment:
+      THREATBRIDGE_EXTRA_CA_FILE: /run/configs/threatbridge_extra_ca
+    configs:
+      - threatbridge_extra_ca
+
+configs:
+  threatbridge_extra_ca:
+    file: ${THREATBRIDGE_EXTRA_CA_PATH:?Set the host path to the reviewed internal CA certificate}

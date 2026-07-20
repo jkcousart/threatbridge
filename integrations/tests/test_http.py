@@ -15,6 +15,7 @@ from integrations.http import request_json as integration_request_json
 from integrations.http_response import ResponseTooLargeError, read_bounded_response
 from integrations.outbound import (
     UnsafeOutboundUrlError,
+    _build_tls_context,
     _create_allowed_connection,
     _PinnedHttpsConnection,
     _ValidatedRedirectHandler,
@@ -247,6 +248,19 @@ class OutboundUrlValidationTests(SimpleTestCase):
 
         self.assertIs(result, connection)
         connection.connect.assert_called_once_with((PRIVATE_TEST_ADDRESS, 443))
+
+    @override_settings(THREATBRIDGE_EXTRA_CA_FILE="/run/configs/internal-root-ca.crt")
+    @patch("integrations.outbound.ssl.create_default_context")
+    def test_tls_context_adds_reviewed_internal_ca(self, create_default_context):
+        context = Mock()
+        create_default_context.return_value = context
+
+        result = _build_tls_context()
+
+        self.assertIs(result, context)
+        context.load_verify_locations.assert_called_once_with(
+            cafile="/run/configs/internal-root-ca.crt"
+        )
 
     def test_tls_connection_retains_original_hostname_for_sni(self):
         tls_context = Mock()

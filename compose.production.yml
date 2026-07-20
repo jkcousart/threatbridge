@@ -1,0 +1,157 @@
+name: threatbridge
+
+x-app-environment: &app-environment
+  DJANGO_DEBUG: "false"
+  DJANGO_SECRET_KEY_FILE: /run/secrets/django_secret_key
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?Set DJANGO_ALLOWED_HOSTS in deploy/.env.production}
+  DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:?Set DJANGO_CSRF_TRUSTED_ORIGINS in deploy/.env.production}
+  DJANGO_SECURE_HSTS_SECONDS: ${DJANGO_SECURE_HSTS_SECONDS:?Set DJANGO_SECURE_HSTS_SECONDS in deploy/.env.production}
+  DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: ${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}
+  DJANGO_SECURE_HSTS_PRELOAD: ${DJANGO_SECURE_HSTS_PRELOAD:-false}
+  DJANGO_TRUST_X_FORWARDED_PROTO: "true"
+  DJANGO_TIME_ZONE: ${DJANGO_TIME_ZONE:-America/Edmonton}
+  DATABASE_URL_FILE: /run/secrets/database_url
+  THREATBRIDGE_DATA_DIR: /app/data
+  THREATBRIDGE_ALLOWED_ADAPTER_PREFIXES: integrations.adapters.
+  THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS: ${THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS:?Set the exact outbound host allowlist}
+  THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS: ${THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS:-}
+  THREATBRIDGE_MAX_PAGES_PER_SYNC: ${THREATBRIDGE_MAX_PAGES_PER_SYNC:-50}
+  THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES: ${THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES:-10485760}
+  THREATBRIDGE_MAX_UPLOAD_BYTES: ${THREATBRIDGE_MAX_UPLOAD_BYTES:-52428800}
+  THREATBRIDGE_MAX_IMPORT_RECORDS: ${THREATBRIDGE_MAX_IMPORT_RECORDS:-100000}
+  THREATBRIDGE_MAX_JSON_DEPTH: ${THREATBRIDGE_MAX_JSON_DEPTH:-20}
+  THREATBRIDGE_MAX_OBJECT_FIELDS: ${THREATBRIDGE_MAX_OBJECT_FIELDS:-500}
+  THREATBRIDGE_MAX_FIELD_NAME_LENGTH: ${THREATBRIDGE_MAX_FIELD_NAME_LENGTH:-200}
+  THREATBRIDGE_MAX_SCALAR_LENGTH: ${THREATBRIDGE_MAX_SCALAR_LENGTH:-100000}
+  THREATBRIDGE_MAX_CSV_COLUMNS: ${THREATBRIDGE_MAX_CSV_COLUMNS:-500}
+  THREATBRIDGE_MAX_CSV_FIELD_LENGTH: ${THREATBRIDGE_MAX_CSV_FIELD_LENGTH:-100000}
+  THREATBRIDGE_MAX_JSONL_LINE_BYTES: ${THREATBRIDGE_MAX_JSONL_LINE_BYTES:-1048576}
+  THREATBRIDGE_MAX_PREVIEW_SAMPLES: ${THREATBRIDGE_MAX_PREVIEW_SAMPLES:-5}
+  THREATBRIDGE_MAX_IMPORT_ERRORS: ${THREATBRIDGE_MAX_IMPORT_ERRORS:-100}
+
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    PYTHON_BUILDER_IMAGE: ${THREATBRIDGE_PYTHON_BUILDER_IMAGE:?Resolve and pin the builder image}
+    PYTHON_RUNTIME_IMAGE: ${THREATBRIDGE_PYTHON_RUNTIME_IMAGE:?Resolve and pin the runtime image}
+
+x-app-security: &app-security
+  user: "65532:65532"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  pids_limit: 256
+
+x-app-secrets: &app-secrets
+  - django_secret_key
+  - database_url
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  db:
+    image: ${THREATBRIDGE_POSTGRES_IMAGE:?Resolve and pin the PostgreSQL image}
+    environment:
+      POSTGRES_DB: threatbridge
+      POSTGRES_USER: threatbridge
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - threatbridge-db:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threatbridge -d threatbridge"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 60s
+    shm_size: 128m
+    logging: *default-logging
+
+  migrate:
+    image: ${THREATBRIDGE_IMAGE:-threatbridge:local}
+    build: *app-build
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    environment: *app-environment
+    secrets: *app-secrets
+    networks:
+      - database
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    <<: *app-security
+    logging: *default-logging
+
+  web:
+    image: ${THREATBRIDGE_IMAGE:-threatbridge:local}
+    build: *app-build
+    command:
+      - gunicorn
+      - threatbridge.wsgi:application
+      - --bind
+      - 0.0.0.0:8000
+      - --workers
+      - ${THREATBRIDGE_GUNICORN_WORKERS:-3}
+      - --threads
+      - ${THREATBRIDGE_GUNICORN_THREADS:-2}
+      - --timeout
+      - ${THREATBRIDGE_GUNICORN_TIMEOUT:-90}
+      - --access-logfile
+      - "-"
+      - --error-logfile
+      - "-"
+    environment: *app-environment
+    secrets: *app-secrets
+    volumes:
+      - threatbridge-data:/app/data
+    networks:
+      - database
+      - edge
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${THREATBRIDGE_BIND_ADDRESS:?Set the dedicated host LAN address}:${THREATBRIDGE_PORT:-8020}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 45s
+    <<: *app-security
+    logging: *default-logging
+
+volumes:
+  threatbridge-db:
+  threatbridge-data:
+
+networks:
+  database:
+    internal: true
+  edge:
+
+secrets:
+  django_secret_key:
+    file: ${THREATBRIDGE_SECRETS_DIR:-./deploy/secrets}/django-secret-key
+  database_url:
+    file: ${THREATBRIDGE_SECRETS_DIR:-./deploy/secrets}/database-url
+  postgres_password:
+    file: ${THREATBRIDGE_SECRETS_DIR:-./deploy/secrets}/postgres-password

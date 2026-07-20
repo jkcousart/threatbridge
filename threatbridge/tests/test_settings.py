@@ -58,6 +58,7 @@ class SecretKeySettingsTests(SimpleTestCase):
         environment = os.environ.copy()
         environment["DJANGO_DEBUG"] = "false"
         environment.pop("DJANGO_SECRET_KEY", None)
+        environment.pop("DJANGO_SECRET_KEY_FILE", None)
 
         result = subprocess.run(
             [sys.executable, "-c", "import threatbridge.settings"],
@@ -91,6 +92,8 @@ class ProductionSettingsTests(SimpleTestCase):
             }
         )
         environment.pop("DJANGO_TRUST_X_FORWARDED_PROTO", None)
+        environment.pop("DJANGO_SECRET_KEY_FILE", None)
+        environment.pop("DATABASE_URL_FILE", None)
         return environment
 
     def _import_settings(self, environment: dict[str, str], expression: str = ""):
@@ -137,6 +140,86 @@ class ProductionSettingsTests(SimpleTestCase):
                 result = self._import_settings(environment)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(expected, result.stderr)
+
+    def test_file_backed_production_secrets_load(self):
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            secret_path = directory / "django-secret-key"
+            database_path = directory / "database-url"
+            secret_path.write_text("file-backed-secret-" * 4, encoding="utf-8")
+            database_path.write_text(
+                "postgresql://threatbridge@database.example.invalid/threatbridge\n",
+                encoding="utf-8",
+            )
+            secret_path.chmod(0o400)
+            database_path.chmod(0o400)
+
+            environment = self._production_environment()
+            environment.pop("DJANGO_SECRET_KEY")
+            environment.pop("DATABASE_URL")
+            environment["DJANGO_SECRET_KEY_FILE"] = str(secret_path)
+            environment["DATABASE_URL_FILE"] = str(database_path)
+            result = self._import_settings(environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_direct_and_file_backed_values_are_mutually_exclusive(self):
+        with TemporaryDirectory() as temporary_directory:
+            secret_path = Path(temporary_directory) / "django-secret-key"
+            secret_path.write_text("duplicate-secret", encoding="utf-8")
+            secret_path.chmod(0o400)
+            environment = self._production_environment()
+            environment["DJANGO_SECRET_KEY_FILE"] = str(secret_path)
+            result = self._import_settings(environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "Set only one of DJANGO_SECRET_KEY or DJANGO_SECRET_KEY_FILE",
+                result.stderr,
+            )
+
+    def test_file_backed_values_reject_relative_symlink_and_writable_files(self):
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            good = directory / "good"
+            good.write_text("value", encoding="utf-8")
+            good.chmod(0o400)
+            symlink = directory / "link"
+            symlink.symlink_to(good)
+            writable = directory / "writable"
+            writable.write_text("value", encoding="utf-8")
+            writable.chmod(0o622)
+
+            for value, expected in (
+                ("relative-secret", "absolute path"),
+                (str(symlink), "must not be a symlink"),
+                (str(writable), "must not be group- or world-writable"),
+            ):
+                with self.subTest(value=value):
+                    environment = self._production_environment()
+                    environment.pop("DJANGO_SECRET_KEY")
+                    environment["DJANGO_SECRET_KEY_FILE"] = value
+                    result = self._import_settings(environment)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected, result.stderr)
+
+    def test_extra_ca_file_must_be_restricted_regular_file(self):
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            ca_file = directory / "internal-root-ca.crt"
+            ca_file.write_text("synthetic-ca", encoding="utf-8")
+            ca_file.chmod(0o444)
+            environment = self._production_environment()
+            environment["THREATBRIDGE_EXTRA_CA_FILE"] = str(ca_file)
+            result = self._import_settings(
+                environment,
+                "settings.THREATBRIDGE_EXTRA_CA_FILE",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(ca_file))
+
+            ca_file.chmod(0o666)
+            result = self._import_settings(environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not be group- or world-writable", result.stderr)
 
     def test_wildcard_hosts_and_sqlite_are_rejected(self):
         environment = self._production_environment()

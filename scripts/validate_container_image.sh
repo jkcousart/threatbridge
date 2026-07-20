@@ -8,67 +8,88 @@ fi
 
 image_ref="$1"
 configured_user="$(docker image inspect --format '{{.Config.User}}' "${image_ref}")"
-if [[ "${configured_user}" != "threatbridge" ]]; then
+if [[ "${configured_user}" != "65532:65532" ]]; then
     echo "Unexpected runtime user: ${configured_user}" >&2
     exit 1
 fi
 if docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${image_ref}" \
-    | grep -q '^DJANGO_SECRET_KEY='; then
-    echo "DJANGO_SECRET_KEY must not persist in the image environment" >&2
+    | grep -qE '^(DJANGO_SECRET_KEY|DATABASE_URL)='; then
+    echo "Runtime secrets must not persist in the image environment" >&2
     exit 1
 fi
 
-expected_contents=$'LICENSE\nNOTICE\ndata\nmanage.py\nstaticfiles'
-actual_contents="$(
-    docker run --rm --network none "${image_ref}" \
-        sh -c "find /app -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort"
-)"
-if [[ "${actual_contents}" != "${expected_contents}" ]]; then
-    echo "Unexpected /app contents:" >&2
-    printf '%s\n' "${actual_contents}" >&2
-    exit 1
-fi
+validation_script="$(cat <<'PY'
+from __future__ import annotations
 
-docker run --rm --network none "${image_ref}" sh -c '
-set -eu
-export PIP_DISABLE_PIP_VERSION_CHECK=1
-export PIP_NO_CACHE_DIR=1
-test "$(id -u)" -ne 0
-test "$(id -u)" -eq 100
-test "$(stat -c %U:%G /app/data)" = threatbridge:threatbridge
-test "$(stat -c %a /app)" = 755
-test "$(stat -c %a /app/data)" = 750
-test "$(stat -c %a /app/manage.py)" = 755
-test -z "$(find /app -xdev \( -type f -o -type d \) -perm -0002 -print -quit)"
-test ! -e /app/.secrets
-test ! -e /app/.env
-test ! -e /app/catalog
-test ! -e /app/integrations
-test ! -e /app/threatbridge
-test ! -e /app/requirements
-test ! -e /app/scripts
-test ! -e /app/.github
-test ! -e /app/build
-test ! -e /app/data/incoming
-test -z "$(find /app -name "*.egg-info" -print -quit)"
-test -z "$(find /usr/local/lib/python*/site-packages/catalog /usr/local/lib/python*/site-packages/integrations /usr/local/lib/python*/site-packages/threatbridge -type d -name tests -print -quit)"
-test -f /app/LICENSE
-test -f /app/NOTICE
-test -f /app/staticfiles/admin/css/base.css
-python -m pip check
-python - <<"PY"
+import importlib.util
+import json
+import os
 import pathlib
+import stat
 import sysconfig
 
 import catalog
 import integrations
 import threatbridge
 
-site_packages = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve()
+app = pathlib.Path('/app')
+expected = {'LICENSE', 'NOTICE', 'data', 'manage.py', 'staticfiles'}
+actual = {path.name for path in app.iterdir()}
+if actual != expected:
+    raise SystemExit(f'unexpected /app contents: {sorted(actual)}')
+if os.getuid() != 65532 or os.getgid() != 65532:
+    raise SystemExit(f'unexpected identity: {os.getuid()}:{os.getgid()}')
+checks = {
+    '/app': 0o755,
+    '/app/data': 0o750,
+    '/app/manage.py': 0o755,
+    '/app/LICENSE': 0o644,
+    '/app/NOTICE': 0o644,
+}
+for raw_path, expected_mode in checks.items():
+    path = pathlib.Path(raw_path)
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode != expected_mode:
+        raise SystemExit(f'{path} mode is {mode:o}, expected {expected_mode:o}')
+if app.joinpath('data').stat().st_uid != 65532:
+    raise SystemExit('/app/data is not owned by runtime UID 65532')
+for path in app.rglob('*'):
+    if stat.S_IMODE(path.lstat().st_mode) & 0o002:
+        raise SystemExit(f'world-writable runtime path: {path}')
+for forbidden in (
+    '.secrets', '.env', 'catalog', 'integrations', 'threatbridge', 'requirements',
+    'scripts', '.github', 'build', 'data/incoming'
+):
+    if app.joinpath(forbidden).exists():
+        raise SystemExit(f'forbidden runtime path: /app/{forbidden}')
+if not app.joinpath('staticfiles/admin/css/base.css').is_file():
+    raise SystemExit('Django admin static files are missing')
+if importlib.util.find_spec('pip') is not None:
+    raise SystemExit('pip must not be present in the runtime environment')
+site_packages = pathlib.Path(sysconfig.get_paths()['purelib']).resolve()
+for package_name in ('catalog', 'integrations', 'threatbridge'):
+    package_root = site_packages / package_name
+    if any(path.name == 'tests' for path in package_root.rglob('tests')):
+        raise SystemExit(f'test package present in runtime wheel: {package_name}')
 for module in (threatbridge, catalog, integrations):
     module_path = pathlib.Path(module.__file__).resolve()
     if not module_path.is_relative_to(site_packages):
-        raise SystemExit(f"{module.__name__} is not imported from the wheel: {module_path}")
-    print(f"{module.__name__}={module_path}")
+        raise SystemExit(f'{module.__name__} is not imported from the installed wheel: {module_path}')
+    if '/opt/runtime-venv/' not in str(module_path):
+        raise SystemExit(f'{module.__name__} is outside the runtime virtual environment: {module_path}')
+print(json.dumps({
+    'uid': os.getuid(),
+    'gid': os.getgid(),
+    'site_packages': str(site_packages),
+    'modules': {
+        module.__name__: str(pathlib.Path(module.__file__).resolve())
+        for module in (threatbridge, catalog, integrations)
+    },
+}, sort_keys=True))
 PY
-'
+)"
+
+docker run --rm --network none --entrypoint python "${image_ref}" \
+    -c "${validation_script}"
+
+printf 'Container validation passed for %s\n' "${image_ref}"
