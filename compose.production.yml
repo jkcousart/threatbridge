@@ -8,7 +8,10 @@ x-app-environment: &app-environment
   DJANGO_SECURE_HSTS_SECONDS: ${DJANGO_SECURE_HSTS_SECONDS:?Set DJANGO_SECURE_HSTS_SECONDS in deploy/.env.production}
   DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: ${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}
   DJANGO_SECURE_HSTS_PRELOAD: ${DJANGO_SECURE_HSTS_PRELOAD:-false}
-  DJANGO_TRUST_X_FORWARDED_PROTO: "true"
+  # Defaults to false. Enable only when a reverse proxy terminates TLS *and*
+  # unconditionally overwrites X-Forwarded-Proto, and the published container port is
+  # unreachable by clients. See docs/deployment-hardening.md.
+  DJANGO_TRUST_X_FORWARDED_PROTO: ${THREATBRIDGE_TRUST_X_FORWARDED_PROTO:-false}
   DJANGO_TIME_ZONE: ${DJANGO_TIME_ZONE:-America/Edmonton}
   DATABASE_URL_FILE: /run/secrets/database_url
   THREATBRIDGE_DATA_DIR: /app/data
@@ -28,6 +31,9 @@ x-app-environment: &app-environment
   THREATBRIDGE_MAX_JSONL_LINE_BYTES: ${THREATBRIDGE_MAX_JSONL_LINE_BYTES:-1048576}
   THREATBRIDGE_MAX_PREVIEW_SAMPLES: ${THREATBRIDGE_MAX_PREVIEW_SAMPLES:-5}
   THREATBRIDGE_MAX_IMPORT_ERRORS: ${THREATBRIDGE_MAX_IMPORT_ERRORS:-100}
+  THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT: ${THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT:-10}
+  THREATBRIDGE_ANON_THROTTLE_RATE: ${THREATBRIDGE_ANON_THROTTLE_RATE:-30/minute}
+  THREATBRIDGE_USER_THROTTLE_RATE: ${THREATBRIDGE_USER_THROTTLE_RATE:-600/minute}
 
 x-app-build: &app-build
   context: .
@@ -44,8 +50,19 @@ x-app-security: &app-security
   security_opt:
     - no-new-privileges:true
   tmpfs:
-    - /tmp:rw,noexec,nosuid,nodev,size=64m
+    # The only writable path outside the named data volume. Gunicorn needs it for worker
+    # heartbeat files; nothing there is ever executed.
+    - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
   pids_limit: 256
+  # PID 1 reaping for any short-lived child processes under a read-only root.
+  init: true
+  deploy:
+    resources:
+      limits:
+        cpus: ${THREATBRIDGE_APP_CPU_LIMIT:-2.0}
+        memory: ${THREATBRIDGE_APP_MEMORY_LIMIT:-1g}
+      reservations:
+        memory: ${THREATBRIDGE_APP_MEMORY_RESERVATION:-256m}
 
 x-app-secrets: &app-secrets
   - django_secret_key
@@ -79,6 +96,41 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
     shm_size: 128m
+    # The official PostgreSQL entrypoint starts as root and drops to the postgres user,
+    # so it needs a writable root and the capabilities to change ownership. Privilege
+    # escalation is still blocked and the container is never exposed outside the
+    # internal database network. See docs/deployment-hardening.md for the residual risk.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: 512
+    init: true
+    deploy:
+      resources:
+        limits:
+          cpus: ${THREATBRIDGE_DB_CPU_LIMIT:-2.0}
+          memory: ${THREATBRIDGE_DB_MEMORY_LIMIT:-1g}
+        reservations:
+          memory: ${THREATBRIDGE_DB_MEMORY_RESERVATION:-256m}
+    logging: *default-logging
+
+  # Runs Django's deployment checks before anything touches the database or serves
+  # traffic, so a misconfigured production environment fails closed at startup.
+  deploy-check:
+    image: ${THREATBRIDGE_IMAGE:-threatbridge:local}
+    build: *app-build
+    command: ["python", "manage.py", "check", "--deploy", "--fail-level", "ERROR"]
+    environment: *app-environment
+    secrets: *app-secrets
+    restart: "no"
+    <<: *app-security
     logging: *default-logging
 
   migrate:
@@ -92,6 +144,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      deploy-check:
+        condition: service_completed_successfully
     restart: "no"
     <<: *app-security
     logging: *default-logging

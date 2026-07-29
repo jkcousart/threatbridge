@@ -1,5 +1,27 @@
 # ThreatBridge release-candidate validation
 
+> **Status: point-in-time evidence, superseded in part.** This document records the 0.3.0
+> release-candidate validation run performed on 2026-07-19, before the public-release hardening
+> audit. It is retained as historical evidence and is deliberately not rewritten. Two classes of
+> statement here no longer describe the current tree:
+>
+> - **Runtime user and interpreter paths.** The runtime image now runs as numeric UID/GID
+>   `65532:65532` with no named account, and the application resolves from a runtime-only virtual
+>   environment under `/opt/runtime-venv`, not `/usr/local/lib/python3.13/site-packages`. The
+>   observations below are superseded; `scripts/validate_container_image.sh` asserts the current
+>   contract.
+> - **Scan counts and image identity.** The image ID, SBOM digests, report digests, and
+>   critical/high counts below belong to that build and that scanner database. They are not evidence
+>   about any later build. Prebuilt-image publication remains blocked under the policy in
+>   [`container-image-security.md`](container-image-security.md) until a fresh unsuppressed scan of a
+>   fresh image ID is reviewed.
+>
+> Controls added after this run — weak-secret rejection, the explicit `DJANGO_DEBUG` requirement at
+> the WSGI/ASGI entry points, log redaction, API throttling, request and upload limits, the
+> `deploy-check` gate, per-service resource and PID limits, the expanded SSRF denylist, and separate
+> connect and read timeouts — are validated in
+> [`security/public-release-hardening-audit.md`](security/public-release-hardening-audit.md), not here.
+
 Validated locally on 2026-07-19 (America/Edmonton) with Python 3.14.4 on the host and Python
 3.13.14 in the container. Both environments resolved Django 6.0.7 and Django REST Framework
 3.17.1. The supported source range remains `Django>=5.2,<7`.

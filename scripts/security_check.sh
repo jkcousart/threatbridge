@@ -21,6 +21,24 @@ trap 'rm -rf "${comparison_dir}" "${public_candidate_dir}"' EXIT
 ./scripts/generate_sbom.sh "${comparison_dir}/threatbridge.cdx.json"
 cmp sbom/threatbridge.cdx.json "${comparison_dir}/threatbridge.cdx.json"
 
+trivy_bin="${TRIVY_BIN:-/tmp/threatbridge-trivy-0.70.0/trivy}"
+if [[ ! -x "${trivy_bin}" ]]; then
+    echo "Trivy is missing. Run scripts/install_trivy.sh, or set" >&2
+    echo "THREATBRIDGE_SKIP_TRIVY=1 to record an explicit, documented exception." >&2
+    if [[ "${THREATBRIDGE_SKIP_TRIVY:-0}" != "1" ]]; then
+        exit 1
+    fi
+else
+    "${trivy_bin}" config \
+        --cache-dir "${TRIVY_CACHE_DIR:-/tmp/threatbridge-trivy-cache}" \
+        --ignorefile /dev/null \
+        --skip-version-check \
+        --severity MEDIUM,HIGH,CRITICAL \
+        --exit-code 1 \
+        --skip-dirs .venv \
+        .
+fi
+
 gitleaks_bin="${GITLEAKS_BIN:-${HOME}/go/bin/gitleaks}"
 mkdir -p "${public_candidate_dir}/source"
 git ls-files -z --cached --others --exclude-standard \

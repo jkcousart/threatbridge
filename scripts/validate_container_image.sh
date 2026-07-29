@@ -18,6 +18,36 @@ if docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${
     exit 1
 fi
 
+exposed_ports="$(
+    docker image inspect \
+        --format '{{range $port, $_ := .Config.ExposedPorts}}{{println $port}}{{end}}' \
+        "${image_ref}" | sort | tr '\n' ' ' | tr -s ' ' | sed 's/ $//'
+)"
+if [[ "${exposed_ports}" != "8000/tcp" ]]; then
+    echo "Unexpected exposed ports: ${exposed_ports:-none}" >&2
+    exit 1
+fi
+
+for label in \
+    org.opencontainers.image.title \
+    org.opencontainers.image.description \
+    org.opencontainers.image.version \
+    org.opencontainers.image.revision \
+    org.opencontainers.image.created \
+    org.opencontainers.image.licenses \
+    org.opencontainers.image.source \
+    org.opencontainers.image.base.name
+do
+    value="$(
+        docker image inspect \
+            --format "{{index .Config.Labels \"${label}\"}}" "${image_ref}"
+    )"
+    if [[ -z "${value}" ]]; then
+        echo "Missing OCI label: ${label}" >&2
+        exit 1
+    fi
+done
+
 validation_script="$(cat <<'PY'
 from __future__ import annotations
 
@@ -91,5 +121,55 @@ PY
 
 docker run --rm --network none --entrypoint python "${image_ref}" \
     -c "${validation_script}"
+
+# Confirm the image actually operates under the confinement compose.production.yml
+# applies: read-only root, all capabilities dropped, and no privilege escalation.
+confinement_script="$(cat <<'PY'
+from __future__ import annotations
+
+import json
+import pathlib
+
+status = pathlib.Path('/proc/self/status').read_text(encoding='utf-8')
+fields = {}
+for line in status.splitlines():
+    name, _, value = line.partition(':')
+    fields[name.strip()] = value.strip()
+
+if fields.get('NoNewPrivs') != '1':
+    raise SystemExit('no-new-privileges is not active')
+for capability_set in ('CapEff', 'CapPrm', 'CapBnd'):
+    raw = fields.get(capability_set, 'ffffffffffffffff')
+    if int(raw, 16) != 0:
+        raise SystemExit(f'{capability_set} is not empty: {raw}')
+
+for read_only_path in ('/', '/app', '/opt/runtime-venv', '/etc'):
+    probe = pathlib.Path(read_only_path) / 'threatbridge-write-probe'
+    try:
+        probe.write_text('x', encoding='utf-8')
+    except OSError:
+        continue
+    probe.unlink(missing_ok=True)
+    raise SystemExit(f'{read_only_path} is writable under a read-only root filesystem')
+
+writable = pathlib.Path('/tmp/threatbridge-write-probe')
+writable.write_text('x', encoding='utf-8')
+writable.unlink()
+
+if pathlib.Path('/var/run/docker.sock').exists():
+    raise SystemExit('the Docker socket is present inside the container')
+
+print(json.dumps({'no_new_privs': True, 'capabilities': 'none', 'root_fs': 'read-only'}))
+PY
+)"
+
+docker run --rm \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --user 65532:65532 \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777 \
+    --entrypoint python "${image_ref}" -c "${confinement_script}"
 
 printf 'Container validation passed for %s\n' "${image_ref}"

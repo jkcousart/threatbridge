@@ -9,7 +9,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request
 
 from .http_response import ResponseTooLargeError, read_bounded_response
-from .outbound import UnsafeOutboundUrlError, open_outbound_request
+from .outbound import BASE_REQUEST_HEADERS, UnsafeOutboundUrlError, open_outbound_request
 
 
 @dataclass
@@ -43,7 +43,7 @@ def request_json(
     form_body: Mapping[str, Any] | None = None,
     timeout: int = 30,
 ) -> Mapping[str, Any]:
-    request_headers = {"Accept": "application/json", **dict(headers or {})}
+    request_headers = {**BASE_REQUEST_HEADERS, **dict(headers or {})}
     body: bytes | None = None
     if json_body is not None and form_body is not None:
         raise ValueError("Choose either json_body or form_body")

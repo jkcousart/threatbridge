@@ -29,6 +29,29 @@ base retained the current slim image. Both candidates passed identical startup, 
 installed-wheel import, ownership, and permissions checks. The current slim result was smaller,
 contained fewer operating-system packages, and had fewer Trivy critical/high findings. Exact
 comparison evidence is regenerated under the ignored `release-evidence/` directory.
+`scripts/compare_base_images.sh` exits non-zero unless every candidate's scan passes, so a blocked
+or skipped comparison cannot be mistaken for an approval.
+
+The production Compose profile resolves its own digests separately from these Dockerfile defaults.
+`scripts/resolve_production_images.sh` defaults both `THREATBRIDGE_BUILDER_TAG` and
+`THREATBRIDGE_RUNTIME_TAG` to the publicly pullable `python:3.13-slim`, so any third party can
+reproduce the documented deployment without a registry subscription. Override either variable to
+build from a hardened, mirrored, or private base; digest pinning and image validation are unchanged.
+
+## Dependency locks
+
+`requirements/runtime.txt`, `requirements/development.txt`, and `requirements/build.txt` are separate,
+fully pinned, and hash-locked; every install uses `--require-hashes`.
+`scripts/validate_dependency_locks.py` fails closed: it rejects a lock without hashes, an unpinned or
+range-specified requirement, a missing hash algorithm, or drift between `pyproject.toml` and the
+locks. Runtime and development dependencies never share a lock, so development tooling cannot reach
+the container image. `ci.yml` audits both locks with `pip-audit --require-hashes --disable-pip`, and
+`lock-freshness.yml` re-resolves them weekly without modifying the repository.
+
+`.github/dependabot.yml` covers `pip` and `github-actions`. `dependency-review.yml` fails a pull
+request at MODERATE severity or above for both runtime and development scopes, and denies AGPL, SSPL,
+and BUSL licences so that a change to ThreatBridge's redistribution obligations must be an explicit,
+reviewed decision rather than a transitive surprise.
 
 ## GitHub actions
 
@@ -46,6 +69,15 @@ concurrency and only approved unprivileged triggers; `pull_request_target` is re
 Review v5 uses its Node 24 runtime on the supported
 `ubuntu-24.04` GitHub-hosted runner. No workflow publishes packages, containers, signatures, or
 release artifacts.
+
+Because every workflow runs on `pull_request` rather than `pull_request_target`, a pull request from a
+fork executes with a read-only token in the fork's context and receives no repository secret. No
+workflow consumes a secret, so no generated artifact can contain one.
+
+The workflow set is `ci.yml`, `codeql.yml`, `container-scan.yml`, `dependency-review.yml`,
+`lock-freshness.yml`, and `sbom.yml`. `tests/test_release_tooling.py` asserts that the
+security-relevant workflows exist, validates whatever is on disk rather than a hard-coded count, and
+asserts that no step uses `continue-on-error` or otherwise swallows a failure.
 
 ## SBOM
 

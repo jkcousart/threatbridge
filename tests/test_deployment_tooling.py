@@ -12,14 +12,152 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
+APP_SERVICES = ("deploy-check", "migrate", "web")
+
+
+def load_production_compose() -> dict:
+    return yaml.safe_load((ROOT / "compose.production.yml").read_text(encoding="utf-8"))
+
+
 def test_production_compose_separates_database_and_edge_networks() -> None:
-    compose = yaml.safe_load((ROOT / "compose.production.yml").read_text(encoding="utf-8"))
+    compose = load_production_compose()
     services = compose["services"]
-    assert set(services) == {"db", "migrate", "web"}
+    assert set(services) == {"db", *APP_SERVICES}
     assert "ports" not in services["db"]
     assert services["db"]["networks"] == ["database"]
     assert compose["networks"]["database"]["internal"] is True
     assert services["web"]["networks"] == ["database", "edge"]
+    # deploy-check never needs network access; it only reads configuration.
+    assert "networks" not in services["deploy-check"]
+
+
+def test_production_compose_runs_django_deployment_checks_before_serving() -> None:
+    services = load_production_compose()["services"]
+    assert services["deploy-check"]["command"] == [
+        "python",
+        "manage.py",
+        "check",
+        "--deploy",
+        "--fail-level",
+        "ERROR",
+    ]
+    assert services["migrate"]["depends_on"]["deploy-check"]["condition"] == (
+        "service_completed_successfully"
+    )
+
+
+def test_production_compose_applies_runtime_confinement_to_every_app_service() -> None:
+    services = load_production_compose()["services"]
+    for name in APP_SERVICES:
+        service = services[name]
+        assert service["read_only"] is True, name
+        assert service["cap_drop"] == ["ALL"], name
+        assert service["security_opt"] == ["no-new-privileges:true"], name
+        assert service["user"] == "65532:65532", name
+        assert service["init"] is True, name
+        assert service["pids_limit"] > 0, name
+        assert "cap_add" not in service, name
+        assert "privileged" not in service, name
+        limits = service["deploy"]["resources"]["limits"]
+        assert limits["cpus"] and limits["memory"], name
+        tmpfs = service["tmpfs"]
+        assert len(tmpfs) == 1, name
+        assert tmpfs[0].startswith("/tmp:"), name
+        for option in ("noexec", "nosuid", "nodev", "size="):
+            assert option in tmpfs[0], (name, option)
+
+
+def test_production_compose_grants_the_database_only_the_capabilities_it_needs() -> None:
+    database = load_production_compose()["services"]["db"]
+    assert database["cap_drop"] == ["ALL"]
+    assert database["security_opt"] == ["no-new-privileges:true"]
+    assert set(database["cap_add"]) == {
+        "CHOWN",
+        "DAC_OVERRIDE",
+        "FOWNER",
+        "SETGID",
+        "SETUID",
+    }
+    assert database["pids_limit"] > 0
+    assert database["deploy"]["resources"]["limits"]["memory"]
+
+
+def test_production_compose_shares_no_host_namespace_or_privileged_path() -> None:
+    source = (ROOT / "compose.production.yml").read_text(encoding="utf-8")
+    forbidden = (
+        "privileged: true",
+        "/var/run/docker.sock",
+        "docker.sock",
+        "network_mode: host",
+        "pid: host",
+        "ipc: host",
+        "userns_mode: host",
+        "/proc",
+        "/sys",
+        "/dev",
+        "extra_hosts",
+        "sysctls",
+        "devices:",
+    )
+    for entry in forbidden:
+        assert entry not in source, entry
+    compose = load_production_compose()
+    for name, service in compose["services"].items():
+        assert service.get("privileged") is not True, name
+        assert "devices" not in service, name
+        assert "sysctls" not in service, name
+        assert "extra_hosts" not in service, name
+        assert service["logging"]["options"]["max-size"], name
+
+
+def test_production_compose_publishes_only_an_explicit_bound_port() -> None:
+    services = load_production_compose()["services"]
+    assert services["web"]["ports"] == [
+        "${THREATBRIDGE_BIND_ADDRESS:?Set the dedicated host LAN address}"
+        ":${THREATBRIDGE_PORT:-8020}:8000"
+    ]
+    for name in ("db", "deploy-check", "migrate"):
+        assert "ports" not in services[name], name
+
+
+def test_production_compose_does_not_trust_forwarded_proto_by_default() -> None:
+    compose = load_production_compose()
+    trust = compose["x-app-environment"]["DJANGO_TRUST_X_FORWARDED_PROTO"]
+    assert trust == "${THREATBRIDGE_TRUST_X_FORWARDED_PROTO:-false}"
+    example = (ROOT / "deploy" / ".env.production.example").read_text(encoding="utf-8")
+    assert "THREATBRIDGE_TRUST_X_FORWARDED_PROTO=false" in example
+
+
+def test_development_compose_stays_on_loopback_and_drops_capabilities() -> None:
+    compose = yaml.safe_load((ROOT / "compose.yml").read_text(encoding="utf-8"))
+    web = compose["services"]["web"]
+    assert web["ports"] == ["127.0.0.1:8000:8000"]
+    assert web["cap_drop"] == ["ALL"]
+    assert web["security_opt"] == ["no-new-privileges:true"]
+    assert web["user"] == "65532:65532"
+    assert web["environment"]["DJANGO_DEBUG"] == "true"
+
+
+def test_container_image_declares_opencontainers_provenance_labels() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    for label in (
+        "org.opencontainers.image.title",
+        "org.opencontainers.image.description",
+        "org.opencontainers.image.version",
+        "org.opencontainers.image.revision",
+        "org.opencontainers.image.created",
+        "org.opencontainers.image.licenses",
+        "org.opencontainers.image.source",
+        "org.opencontainers.image.base.name",
+    ):
+        assert label in dockerfile, label
+    assert 'org.opencontainers.image.licenses="Apache-2.0"' in dockerfile
+    # A secret must never be baked in through a build argument or environment default.
+    for forbidden in ("DJANGO_SECRET_KEY_FILE", "ARG DJANGO_SECRET_KEY", "ENV DJANGO_SECRET_KEY"):
+        assert forbidden not in dockerfile, forbidden
+    assert "USER 65532:65532" in dockerfile
+    assert "PYTHONDONTWRITEBYTECODE=1" in dockerfile
+    assert "runserver" not in dockerfile
 
 
 def test_production_compose_runs_migrations_without_a_shell() -> None:
@@ -38,21 +176,42 @@ def test_production_compose_runs_migrations_without_a_shell() -> None:
 
 
 def test_step_ca_overlay_adds_trust_without_disabling_verification() -> None:
-    overlay = yaml.safe_load(
-        (ROOT / "compose.production.step-ca.yml").read_text(encoding="utf-8")
-    )
-    for service_name in ("migrate", "web"):
+    source = (ROOT / "compose.production.step-ca.yml").read_text(encoding="utf-8")
+    overlay = yaml.safe_load(source)
+    for service_name in APP_SERVICES:
         service = overlay["services"][service_name]
         assert service["environment"]["THREATBRIDGE_EXTRA_CA_FILE"] == (
             "/run/configs/threatbridge_extra_ca"
         )
-        assert service["configs"] == ["threatbridge_extra_ca"]
+        # Long syntax pins the mount point and a non-writable mode rather than relying
+        # on the Compose default target.
+        assert service["configs"] == [
+            {
+                "source": "threatbridge_extra_ca",
+                "target": "/run/configs/threatbridge_extra_ca",
+                "uid": "65532",
+                "gid": "65532",
+                "mode": 0o444,
+            }
+        ], service_name
     assert "THREATBRIDGE_EXTRA_CA_PATH" in overlay["configs"][
         "threatbridge_extra_ca"
     ]["file"]
-    assert "insecure" not in (ROOT / "compose.production.step-ca.yml").read_text(
-        encoding="utf-8"
-    ).lower()
+    # Trust material only: no verification switches, no volume mounts, no host CA
+    # directories, and no extra capabilities.
+    for forbidden in (
+        "insecure",
+        "verify=false",
+        "verify_ssl",
+        "volumes:",
+        "/etc/ssl",
+        "/usr/local/share/ca-certificates",
+        "cap_add",
+        "privileged",
+    ):
+        assert forbidden not in source.lower(), forbidden
+    assert set(overlay["services"]) == set(APP_SERVICES)
+    assert set(overlay) == {"x-extra-ca-config", "services", "configs"}
 
 
 def test_production_compose_uses_file_backed_secrets() -> None:
@@ -249,6 +408,47 @@ def test_generated_deployment_material_is_ignored() -> None:
     assert "deploy/secrets" in dockerignore
     assert "deploy/ca" in dockerignore
     assert "backups" in dockerignore
+
+
+def test_private_security_documents_are_ignored_by_a_committed_rule() -> None:
+    """docs/security/ must fail closed through .gitignore, not a local exclude file.
+
+    A private internal report protected only by .git/info/exclude would be committed by
+    anyone who cloned the repository fresh, so the rule has to be in the tree.
+    """
+
+    candidates = (
+        "docs/security/hardening-phase-1-report.md",
+        "docs/security/some-new-internal-report.md",
+        "docs/security/private-notes.md",
+        "docs/security/tmkb/nested/finding.md",
+    )
+    for candidate in candidates:
+        result = subprocess.run(
+            ["git", "check-ignore", "-v", "--no-index", candidate],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, candidate
+        assert result.stdout.startswith(".gitignore:"), (candidate, result.stdout)
+
+    published = subprocess.run(
+        [
+            "git",
+            "check-ignore",
+            "-v",
+            "--no-index",
+            "docs/security/public-release-hardening-audit.md",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert "!docs/security/public-release-hardening-audit.md" in published.stdout
+    assert "docs/security" in (ROOT / ".dockerignore").read_text(encoding="utf-8")
 
 
 def test_deployment_scripts_have_no_windows_line_endings() -> None:

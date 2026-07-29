@@ -45,14 +45,16 @@ build_candidate() {
     fi
 }
 
+# "official" is the digest recorded in the Dockerfile; "pinned" is whatever
+# deploy/.env.production resolved, which may point at a different registry.
 build_candidate official "${current_ref}" "${current_ref}"
-build_candidate dhi \
+build_candidate pinned \
     "${builder_image}" \
     "${runtime_image}"
 
 {
     echo "candidate image_id size_bytes configured_user scan_policy"
-    for name in official dhi; do
+    for name in official pinned; do
         read -r image_id size_bytes configured_user < "${output_dir}/${name}.image.txt"
         scan_policy="$(awk -F= '/^scan_policy=/{print $2}' "${output_dir}/${name}.image.txt")"
         printf '%s %s %s %s %s\n' \
@@ -65,3 +67,17 @@ Comparison evidence written to ${output_dir}.
 Do not select or publish a base solely from package counts. Review application compatibility,
 exact findings, fix availability, runtime reachability, and operational support first.
 EOF2
+
+# Evidence collection must still fail closed: a blocked or skipped scan is not a pass.
+blocked=0
+for name in official pinned; do
+    scan_policy="$(awk -F= '/^scan_policy=/{print $2}' "${output_dir}/${name}.image.txt")"
+    if [[ "${scan_policy}" != "pass" ]]; then
+        echo "Candidate ${name} scan_policy=${scan_policy}; not eligible for publication." >&2
+        blocked=1
+    fi
+done
+if [[ "${blocked}" -ne 0 ]]; then
+    echo "Base-image comparison completed with blocking findings." >&2
+    exit 1
+fi

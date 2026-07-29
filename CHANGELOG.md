@@ -42,6 +42,20 @@
 - Centralized outbound URL validation with exact host allowlists, explicit private CIDR permissions, prohibited-address checks, URL-userinfo rejection, production HTTPS enforcement, proxy disabling, DNS revalidation, and connection pinning.
 - Restricted redirects to the same scheme, normalized hostname, and effective port, including explicit rejection of invalid and zero-valued ports.
 - Corrected public documentation to distinguish latest-record storage and normalized projections from immutable or append-only source history, and documented malware scanning and quarantine as production requirements rather than implemented features.
+- Rejected weak, short, low-entropy, and placeholder production `SECRET_KEY` values, and required an explicit `DJANGO_DEBUG` decision at the WSGI and ASGI entry points so a production process can never inherit the development default.
+- Refused to enable HSTS preload or subdomain inclusion before the corresponding rollout is complete.
+- Redacted `Authorization` and `Cookie` headers, bearer/basic/token credentials, URL userinfo, and sensitive query parameters on every logging handler, including the Gunicorn access and error logs, and added a deployment check that fails if any handler omits the filter.
+- Added Django REST Framework anonymous and authenticated throttling, configurable through `THREATBRIDGE_ANON_THROTTLE_RATE` and `THREATBRIDGE_USER_THROTTLE_RATE`, with a deployment check that requires both rates.
+- Aligned Django request limits with the application's import limits, capped form fields and uploaded files per request, restricted stored upload permissions, and stopped trusting forwarded host and port headers.
+- Refused cloud-metadata hostnames even when allowlisted, and refused 6to4, Teredo, and NAT64 prefixes that embed an inner IPv4 address behind a globally routable prefix.
+- Separated the connector connect timeout from the read timeout through `THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT`, declared an explicit redirect ceiling, and replaced the default `urllib` user agent with a fixed `ThreatBridge/0.3` identity that discloses no host or interpreter detail.
+- Hardened both Compose profiles: the development profile now binds only `127.0.0.1`, runs unprivileged with all capabilities dropped, and rotates logs; the production profile gates startup behind `manage.py check --deploy --fail-level ERROR`, stops trusting `X-Forwarded-Proto` by default, and adds `init`, PID, CPU, and memory limits to every service, with a minimal capability set for PostgreSQL.
+- Mounted the optional step-ca trust anchor through explicit long-syntax Compose configuration with a pinned in-container path, owner, and read-only mode, and extended it to the deployment-check and migration services.
+- Defaulted the production image resolver to publicly pullable base images so a third party can reproduce the documented deployment without a private registry, keeping hardened bases available as an override.
+- Added OpenContainers provenance labels to the runtime image and extended image validation to assert the exposed port, the complete label set, and a hardened second run proving a non-root UID, read-only root filesystem, empty capability set, `NoNewPrivs`, a writable `/tmp`, and no Docker socket.
+- Added a container and filesystem scanning workflow, denied network-copyleft and source-available dependency licences in dependency review, and made base-image comparison exit non-zero unless every candidate scan passes.
+- Ignored private security work products by default in both `.gitignore` and `.dockerignore`, requiring an explicit exception to publish one.
+- Added regression tests for secret strength, HSTS staging, upload limits, throttling, log redaction, entry-point debug enforcement, SSRF metadata and tunnel rejection, timeout separation, authorization denials on every state-changing endpoint, Compose confinement, and workflow failure handling.
 
 ## 0.3.0
 

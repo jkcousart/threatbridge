@@ -74,14 +74,18 @@ docker compose exec web python manage.py createsuperuser
 docker compose exec web python manage.py seed_demo
 ```
 
-Then open `http://127.0.0.1:8000/`. Development mode generates a persistent local Django secret
-inside the container and uses intentionally local database credentials. Do not expose this profile.
+Then open `http://127.0.0.1:8000/`. The development profile publishes only on `127.0.0.1:8000`,
+generates a persistent local Django secret inside the container, and uses an intentionally
+well-known local database password. Do not expose this profile.
 
-For a shared or homelab deployment, use `compose.production.yml`. It provides a shell-free non-root
-application image, immutable image inputs, file-backed secrets, a one-shot migration service, an
-internal-only PostgreSQL network, read-only application containers, health checks, backup/restore
-helpers, and port `8020` for a restricted reverse-proxy path. See
-[`deploy/README.md`](deploy/README.md) for the complete procedure.
+For a shared or homelab deployment, use `compose.production.yml`. It provides a non-root application
+image, immutable image digests, file-backed secrets, a deployment-check gate and a one-shot migration
+service before the web service starts, an internal-only PostgreSQL network, read-only application
+containers with all capabilities dropped and `no-new-privileges`, per-service CPU/memory/PID limits,
+health checks, log rotation, and backup/restore helpers. It publishes nothing until you set
+`THREATBRIDGE_BIND_ADDRESS`; the documented default is `127.0.0.1:8020`, intended to sit behind a
+reverse proxy that terminates TLS. See [`deploy/README.md`](deploy/README.md) for the complete
+procedure and [`docs/deployment-hardening.md`](docs/deployment-hardening.md) for the control set.
 
 ## Importing CSV and JSON
 
@@ -315,12 +319,17 @@ from this release.
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated hosts | `localhost,127.0.0.1` |
 | `DJANGO_CSRF_TRUSTED_ORIGINS` | Comma-separated origins | Empty |
 | `DJANGO_SECURE_HSTS_SECONDS` | Explicit production HSTS duration | Required in production |
+| `DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS` | Extend HSTS to subdomains; rejected while the duration is zero | `false` |
+| `DJANGO_SECURE_HSTS_PRELOAD` | Request preload; requires a full year and subdomain inclusion | `false` |
 | `DJANGO_TRUST_X_FORWARDED_PROTO` | Trust a stripping proxy's forwarded HTTPS header | `false` |
+| `DJANGO_LOG_LEVEL` | Application log level; every handler redacts credentials | `INFO` |
 | `DJANGO_TIME_ZONE` | Display/default timezone | `UTC` |
 | `DATABASE_URL` | SQLite or PostgreSQL connection; mutually exclusive with its file form | Local SQLite |
 | `DATABASE_URL_FILE` | Absolute non-symlink file containing the database URL | Empty |
 | `THREATBRIDGE_DATA_DIR` | Connector and upload data directory | `./data` |
-| `THREATBRIDGE_MAX_UPLOAD_BYTES` | Multipart file-size limit | `52428800` |
+| `THREATBRIDGE_MAX_UPLOAD_BYTES` | Multipart file-size limit; also bounds Django's request body | `52428800` |
+| `THREATBRIDGE_MAX_REQUEST_FIELDS` | Maximum form fields in one request | `200` |
+| `THREATBRIDGE_MAX_REQUEST_FILES` | Maximum uploaded files in one request | `10` |
 | `THREATBRIDGE_MAX_IMPORT_RECORDS` | Records allowed in one file import | `100000` |
 | `THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES` | Maximum connector response body | `10485760` |
 | `THREATBRIDGE_MAX_JSON_DEPTH` | Maximum imported JSON nesting | `20` |
@@ -337,15 +346,25 @@ from this release.
 | `THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS` | Exact connector destination hostnames or IP literals | Empty |
 | `THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS` | Private CIDRs permitted for exact allowlisted hosts | Empty |
 | `THREATBRIDGE_EXTRA_CA_FILE` | Additional reviewed CA certificate added to the default TLS trust store | Empty |
+| `THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT` | Connector TCP/TLS connect timeout, capped by the read timeout | `10` |
+| `THREATBRIDGE_ANON_THROTTLE_RATE` | REST API rate limit for anonymous callers | `30/minute` |
+| `THREATBRIDGE_USER_THROTTLE_RATE` | REST API rate limit for authenticated callers | `600/minute` |
 
 ## Security boundaries
 
+- **ThreatBridge is not a malware sandbox.** Imported files are parsed as data, never executed,
+  detonated, unpacked, or emulated.
+- **Docker reduces deployment risk but is not an absolute security boundary.** Containers share the
+  host kernel; treat the container profile as defence in depth, not isolation for hostile code.
+- **Nothing is exposed publicly by default.** The development profile binds `127.0.0.1:8000`; the
+  production profile publishes only on a bind address you set explicitly and expects a reverse proxy
+  to terminate TLS.
 - External integrations are read-only by design.
 - File uploads require a named permission and enforce byte, record, structure, nesting, field,
   line, preview, and retained-error limits under a server-controlled path.
 - Uploaded filenames are not used as storage paths; ThreatBridge generates random names and stores the original name as metadata.
 - Credentials are not stored in integration configuration. `secret_reference` resolves credentials from an external source such as environment variables.
-- Every connector destination requires an exact outbound-host allowlist entry. Private destinations additionally require every DNS answer to fall within an explicitly allowed private CIDR.
+- Every connector destination requires an exact outbound-host allowlist entry. Private destinations additionally require every DNS answer to fall within an explicitly allowed private CIDR. Loopback, link-local, cloud-metadata, multicast, unspecified, and IPv4-embedding tunnel addresses are always refused, resolved addresses are revalidated immediately before connection, redirects are re-validated and capped, and certificate verification is never disabled. A private CA is added with `THREATBRIDGE_EXTRA_CA_FILE`.
 - Connector response bodies are bounded before complete in-memory loading, and stored/displayed
   connector failures omit bodies, query strings, headers, and resolved secrets.
 - Each `ExternalObject` row retains the latest raw and normalized version for its integration/type/external-ID key, with a content hash and provenance timestamps; it is not an append-only version history.
@@ -358,17 +377,37 @@ from this release.
 - Security audit events and ATT&CK review events are append-only through application and admin
   paths, with bounded redacted metadata.
 - Write-back, automatic blocking, rule deployment, scan execution, and remediation are outside the MVP.
+- Authorization is role-based and global rather than per-object: a user holding a named permission can
+  act on every object of that type.
+- Every logging handler, including Gunicorn's access log, redacts `Authorization` and `Cookie`
+  headers, bearer/basic/token credentials, URL userinfo, and sensitive query parameters.
+- SQLite is a development convenience only. Production requires PostgreSQL and startup refuses any
+  other database; see [`docs/deployment-hardening.md`](docs/deployment-hardening.md) for durability
+  and backup expectations.
 - Do not ingest PHI, patient records, secrets, access tokens, or private keys.
 - Malware scanning and quarantine are not implemented. Production deployments must add both before accepting untrusted uploads.
 
-Production requirements and fail-closed settings are documented in
-[`docs/deployment-hardening.md`](docs/deployment-hardening.md). Tenant isolation, organization
-scoping, Entra ID/enterprise SSO, full TLP enforcement, automatic policy decisions, connector
-write-back, and automatic remediation are not implemented.
+ThreatBridge is aligned with, and informed by, the CIS Docker Benchmark, OWASP container security
+guidance, OpenSSF repository practices, and Django deployment guidance. It is not certified against
+any of them.
+
+Production requirements and fail-closed settings, the split between repository-enforced and
+host-administrator-enforced controls, and the residual-risk list are documented in
+[`docs/deployment-hardening.md`](docs/deployment-hardening.md). The threat model and SSRF policy are
+in [`docs/security-architecture.md`](docs/security-architecture.md), and vulnerability reporting is in
+[`SECURITY.md`](SECURITY.md). Tenant isolation, organization scoping, Entra ID/enterprise SSO, full
+TLP enforcement, automatic policy decisions, connector write-back, and automatic remediation are not
+implemented.
 
 ## Tests and checks
 
 ```bash
+python -m pytest
+python -m ruff check .
+python -m ruff format --check .
+python manage.py check
+python scripts/validate_dependency_locks.py
+python scripts/validate_workflows.py
 bash scripts/security_check.sh
 ```
 

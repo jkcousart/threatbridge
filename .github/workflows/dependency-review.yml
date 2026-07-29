@@ -25,3 +25,8 @@ jobs:
         with:
           comment-summary-in-pr: never
           fail-on-severity: moderate
+          fail-on-scopes: runtime, development
+          # ThreatBridge ships under Apache-2.0. Network-copyleft and source-available
+          # licences would change redistribution obligations for downstream users, so a
+          # new dependency under one of them must be an explicit, reviewed decision.
+          deny-licenses: AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, SSPL-1.0, BUSL-1.1

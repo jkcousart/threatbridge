@@ -1,12 +1,28 @@
+# Local development stack only. It runs with DJANGO_DEBUG=true and a well-known
+# database password, so it must never be exposed beyond the loopback interface.
+# Use compose.production.yml for any real deployment.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   db:
     image: postgres:17-alpine
     environment:
       POSTGRES_DB: threatbridge
       POSTGRES_USER: threatbridge
+      # Development-only credential. Never reused by compose.production.yml, which
+      # sources every secret from a file.
       POSTGRES_PASSWORD: threatbridge-dev-only
     volumes:
       - threatbridge-db:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    init: true
+    logging: *default-logging
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U threatbridge -d threatbridge"]
       interval: 5s
@@ -28,9 +44,18 @@ services:
       THREATBRIDGE_MAX_UPLOAD_BYTES: "52428800"
       THREATBRIDGE_MAX_IMPORT_RECORDS: "100000"
     ports:
-      - "8000:8000"
+      # Loopback only. Publishing on 0.0.0.0 would expose a DEBUG deployment.
+      - "127.0.0.1:8000:8000"
     volumes:
       - threatbridge-data:/app/data
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    init: true
+    logging: *default-logging
     depends_on:
       db:
         condition: service_healthy

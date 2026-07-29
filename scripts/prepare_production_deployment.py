@@ -182,7 +182,7 @@ def main() -> None:
 
     print(f"Created production environment: {env_file}")
     print(f"Created or preserved secret directory: {secrets_dir}")
-    print("Next: docker login dhi.io && bash scripts/resolve_production_images.sh")
+    print("Next: bash scripts/resolve_production_images.sh")
 
 
 if __name__ == "__main__":

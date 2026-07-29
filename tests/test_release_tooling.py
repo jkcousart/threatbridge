@@ -36,11 +36,43 @@ def write_workflow(tmp_path: Path, source: str, *, name: str = "workflow.yml") -
 
 
 def test_current_workflows_are_valid() -> None:
-    workflow_count, action_count = validate_workflow_directory(
-        PROJECT_ROOT / ".github" / "workflows"
+    workflow_directory = PROJECT_ROOT / ".github" / "workflows"
+    workflow_count, action_count = validate_workflow_directory(workflow_directory)
+    # Derived from what is on disk rather than hard-coded, so adding a workflow or
+    # letting Dependabot bump a pinned action does not require editing this test.
+    on_disk = sorted(
+        (*workflow_directory.glob("*.yml"), *workflow_directory.glob("*.yaml"))
     )
-    assert workflow_count == 5
-    assert action_count == 11
+    assert workflow_count == len(on_disk)
+    assert action_count == sum(
+        1
+        for path in on_disk
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if "uses:" in line
+    )
+    assert action_count >= workflow_count
+
+
+def test_required_security_workflows_are_present() -> None:
+    workflow_directory = PROJECT_ROOT / ".github" / "workflows"
+    names = {path.name for path in workflow_directory.glob("*.yml")}
+    for required in (
+        "ci.yml",
+        "codeql.yml",
+        "container-scan.yml",
+        "dependency-review.yml",
+        "lock-freshness.yml",
+        "sbom.yml",
+    ):
+        assert required in names, required
+
+
+def test_no_workflow_silently_ignores_a_failing_step() -> None:
+    workflow_directory = PROJECT_ROOT / ".github" / "workflows"
+    for path in sorted(workflow_directory.glob("*.yml")):
+        source = path.read_text(encoding="utf-8")
+        for suppression in ("continue-on-error", "|| true", "set +e", "--exit-code 0"):
+            assert suppression not in source, (path.name, suppression)
 
 
 @pytest.mark.parametrize(

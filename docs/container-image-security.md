@@ -78,13 +78,39 @@ The Dockerfile accepts `PYTHON_BUILDER_IMAGE` and `PYTHON_RUNTIME_IMAGE` build a
 build and runtime virtual environments prevent build tooling from entering the final image; `pip`
 is removed from the copied runtime environment after the locked installation is checked. The final
 stage performs no shell command and runs as UID/GID `65532:65532`, allowing the same application
-artifact to be evaluated against a shell-free hardened runtime. Production configuration resolves
-`dhi.io/python:3.13-dev` and `dhi.io/python:3.13` to immutable manifest digests before building.
-The mutable tags are discovery inputs only and must not remain in the deployed environment file.
+artifact to be evaluated against an alternative or hardened runtime. Production configuration
+resolves `THREATBRIDGE_BUILDER_TAG` and `THREATBRIDGE_RUNTIME_TAG` to immutable manifest digests
+before building. Both default to the publicly pullable `python:3.13-slim`, so a third party can
+reproduce the documented build without a registry subscription; overriding them to a hardened,
+mirrored, or private base is supported and changes nothing about digest pinning or validation. The
+mutable tags are discovery inputs only and must not remain in the deployed environment file.
 
-Use `scripts/compare_base_images.sh` to build and validate both the recorded Docker Official Image
-baseline and the resolved hardened candidate. When Trivy is installed at the approved path, the
-script retains an unsuppressed report for each exact image. It records evidence but never chooses a
-base or changes the finding policy. A candidate is acceptable only after application checks,
-PostgreSQL migrations, readiness, connector TLS behavior, runtime permissions, backup/restore, and
-all exact-image findings are reviewed.
+The runtime stage carries OpenContainers provenance labels for title, description, version,
+revision, creation time, licence, source, documentation, and base image name. `THREATBRIDGE_VERSION`,
+`THREATBRIDGE_REVISION`, and `THREATBRIDGE_CREATED` build arguments supply the variable values; they
+are descriptive metadata and never secrets.
+
+Because the default base is `python:3.13-slim` rather than a distroless or shell-free image, the
+runtime layer still contains a shell and `apt`. That is a deliberate, documented trade-off for
+supportability and compatibility: the application virtual environment contains no build tooling and
+no `pip`, the container runs unprivileged with a read-only root filesystem and no capabilities, and
+`validate_container_image.sh` proves those properties on every build. Changing the base purely to
+reduce a scanner's package count is explicitly not a goal.
+
+Use `scripts/compare_base_images.sh` to build and validate both the `official` baseline recorded in
+the Dockerfile and the `pinned` candidate resolved into `deploy/.env.production`. When Trivy is
+installed at the approved path, the script retains an unsuppressed report for each exact image. It
+records evidence and never chooses a base or changes the finding policy, and it exits non-zero unless
+every candidate's scan passes, so a blocked or skipped scan cannot be read as a pass. A candidate is
+acceptable only after application checks, PostgreSQL migrations, readiness, connector TLS behavior,
+runtime permissions, backup/restore, and all exact-image findings are reviewed.
+
+## Continuous scanning
+
+`.github/workflows/container-scan.yml` runs on relevant pushes and pull requests and weekly. It
+installs the checksum-verified Trivy build, scans the repository for committed secrets, scans the
+Dockerfile for misconfiguration at MEDIUM and above, builds the image from the pinned base digests,
+runs `scripts/validate_container_image.sh`, and then runs `scripts/scan_container_image.sh`, which
+fails the job on any HIGH or CRITICAL image finding. No step uses `continue-on-error` or otherwise
+swallows a failure. Python dependency vulnerabilities are covered separately by `pip-audit` in
+`ci.yml`, which understands the `requirements/*.txt` lock layout.

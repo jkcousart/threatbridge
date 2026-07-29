@@ -79,6 +79,25 @@ RUN DJANGO_DEBUG=false \
 
 FROM ${PYTHON_RUNTIME_IMAGE} AS runtime
 
+# Provenance metadata. THREATBRIDGE_REVISION and THREATBRIDGE_CREATED are supplied by
+# the documented build command; they are descriptive labels only and never secrets.
+ARG THREATBRIDGE_VERSION=0.3.0
+ARG THREATBRIDGE_REVISION=unknown
+ARG THREATBRIDGE_CREATED=unknown
+# Re-declare so the globally scoped digest is readable inside this stage.
+ARG PYTHON_RUNTIME_IMAGE
+
+LABEL org.opencontainers.image.title="ThreatBridge" \
+      org.opencontainers.image.description="Threat-informed integration, evidence, and control-correlation platform" \
+      org.opencontainers.image.version="${THREATBRIDGE_VERSION}" \
+      org.opencontainers.image.revision="${THREATBRIDGE_REVISION}" \
+      org.opencontainers.image.created="${THREATBRIDGE_CREATED}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/jkcousart/threatbridge" \
+      org.opencontainers.image.url="https://github.com/jkcousart/threatbridge" \
+      org.opencontainers.image.documentation="https://github.com/jkcousart/threatbridge/blob/main/docs/deployment-hardening.md" \
+      org.opencontainers.image.base.name="${PYTHON_RUNTIME_IMAGE}"
+
 ENV PATH=/opt/runtime-venv/bin:${PATH} \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

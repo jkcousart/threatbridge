@@ -10,9 +10,14 @@ the unresolved High and Critical findings documented in
 - Canonical Apache-2.0 text, notice, package metadata, and contribution references are prepared,
   approved by the project owner.
 - Hashed build, runtime, and development locks are generated from `pyproject.toml`.
-- The exact Python 3.13.14 slim Docker base is pinned to an immutable manifest digest.
-- GitHub test/security, CodeQL, dependency-review, and SBOM workflows use verified full action
-  SHAs, minimal permissions, explicit timeouts, and concurrency controls.
+- The exact Python 3.13.14 slim Docker base is pinned to an immutable manifest digest. The production
+  Compose profile resolves publicly pullable base tags to digests by default, so a third party can
+  reproduce the documented deployment without a private registry subscription.
+- GitHub test/security, CodeQL, dependency-review, lock-freshness, container-scan, and SBOM workflows
+  use verified full action SHAs, minimal permissions, explicit timeouts, and concurrency controls, and
+  no workflow consumes a secret or uses `pull_request_target`.
+- Dependency review fails a pull request at MODERATE severity for runtime and development scopes and
+  denies network-copyleft and source-available licences.
 - A reproducible CycloneDX runtime SBOM and supply-chain verification guidance are included.
 - The wheel-authoritative image has reproducible local operating-system-aware CycloneDX SBOM
   generation and a pinned, unsuppressed Trivy validation procedure. Digest-bound image evidence is
@@ -29,8 +34,34 @@ the unresolved High and Critical findings documented in
 - Permissioned evidence deletion/restoration and default-hidden deleted records.
 - Structured redacted security events.
 - Bounded connector responses and hostile-file limits.
-- Fail-closed production settings and generic readiness failures.
-- SSRF, DNS-pinning, same-origin redirect, TLS-hostname, private-CIDR, and proxy controls.
+- Fail-closed production settings and generic readiness failures, including rejection of weak or
+  placeholder secret keys, a required explicit `DJANGO_DEBUG` decision at the WSGI/ASGI entry points,
+  and a `deploy-check` gate that runs `manage.py check --deploy --fail-level ERROR` before serving.
+- SSRF, DNS-pinning, same-origin redirect, TLS-hostname, private-CIDR, cloud-metadata,
+  IPv4-embedding-tunnel, and proxy controls with separate connect and read timeouts.
+- Credential redaction on every logging handler, including the Gunicorn access log.
+- REST API throttling for anonymous and authenticated callers, and Django request/upload limits
+  aligned with the application's own import limits.
+- Container confinement aligned with the CIS Docker Benchmark: non-root numeric UID, all capabilities
+  dropped, `no-new-privileges`, read-only root filesystem, bounded `noexec` tmpfs, per-service
+  CPU/memory/PID limits, log rotation, no host namespace or Docker socket, and no published database
+  port.
+
+## Residual risks and limits
+
+- ThreatBridge is not a malware sandbox, and Docker is defence in depth rather than an isolation
+  boundary for hostile code.
+- Authorization is role-based and global rather than per-object.
+- Imports are not one end-to-end atomic transaction.
+- The bundled PostgreSQL container retains five capabilities its entrypoint requires and keeps a
+  writable root filesystem; a separately administered PostgreSQL service is the recommended topology.
+- The bundled database volume has no replication, point-in-time recovery, or automated backup
+  schedule.
+- No release signing or provenance attestation exists yet.
+
+The full list, with the split between what the repository enforces and what the Docker host
+administrator must enforce, is in [`deployment-hardening.md`](deployment-hardening.md). The most
+recent audit is [`security/public-release-hardening-audit.md`](security/public-release-hardening-audit.md).
 
 ## Source-repository publication blockers
 

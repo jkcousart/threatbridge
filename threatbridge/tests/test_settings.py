@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import stat
 import subprocess
@@ -11,8 +13,25 @@ from django.core.exceptions import ImproperlyConfigured
 from django.test import RequestFactory, SimpleTestCase
 
 from threatbridge import settings as threatbridge_settings
+from threatbridge.log_redaction import SensitiveDataFilter, redact
 from threatbridge.startup_audit import record_production_configuration_failure
 from threatbridge.urls import readyz
+
+
+# Synthetic but deliberately strong: long enough, varied enough, and free of the
+# placeholder markers that production configuration validation rejects. Deriving the
+# values keeps a high-entropy literal out of the source tree, where a secret scanner can
+# only treat it as a candidate credential.
+def _strong_test_key(label: str) -> str:
+    return "Tb" + hashlib.blake2b(label.encode(), digest_size=32).hexdigest() + "Zq"
+
+
+STRONG_TEST_SECRET_KEY = _strong_test_key("threatbridge-unit")
+SECOND_STRONG_TEST_SECRET_KEY = _strong_test_key("threatbridge-rotation")
+
+# No credential shape of its own; it only has to prove that redaction removes whatever
+# sits in a credential position.
+REDACTION_FIXTURE_VALUE = "redaction-fixture-value"
 
 
 class SecretKeySettingsTests(SimpleTestCase):
@@ -23,7 +42,33 @@ class SecretKeySettingsTests(SimpleTestCase):
         event = captured.output[0]
         self.assertIn("production_configuration.failed", event)
         self.assertIn("DJANGO_SECRET_KEY", event)
-        self.assertNotIn("synthetic-production-secret", event)
+        self.assertNotIn(STRONG_TEST_SECRET_KEY, event)
+
+    def test_weak_and_placeholder_production_secrets_are_rejected(self):
+        cases = (
+            ("short", "at least 50 characters"),
+            (STRONG_TEST_SECRET_KEY, None),
+            ("change-me-" * 8, "looks like a placeholder"),
+            ("django-insecure-" * 5, "looks like a placeholder"),
+            ("replace-this-secret-" * 4, "looks like a placeholder"),
+            ("abababababababababababababababababababababababababab", "distinct characters"),
+        )
+        for secret, expected in cases:
+            with self.subTest(secret=secret[:12]):
+                if expected is None:
+                    threatbridge_settings._validate_secret_key_strength(secret)
+                    continue
+                with self.assertRaisesRegex(ImproperlyConfigured, expected):
+                    threatbridge_settings._validate_secret_key_strength(secret)
+
+    def test_development_secret_is_not_strength_checked(self):
+        with TemporaryDirectory() as temporary_directory:
+            secret = threatbridge_settings._secret_key(
+                debug=True,
+                configured_secret="short-development-value",
+                local_path=Path(temporary_directory) / "unused",
+            )
+        self.assertEqual(secret, "short-development-value")
 
     def test_development_secret_is_persistent_and_restrictively_permissioned(self):
         with TemporaryDirectory() as temporary_directory:
@@ -80,13 +125,11 @@ class ProductionSettingsTests(SimpleTestCase):
         environment.update(
             {
                 "DJANGO_DEBUG": "false",
-                "DJANGO_SECRET_KEY": "synthetic-production-secret-" * 4,
+                "DJANGO_SECRET_KEY": STRONG_TEST_SECRET_KEY,
                 "DJANGO_ALLOWED_HOSTS": "threatbridge.example.invalid",
                 "DJANGO_CSRF_TRUSTED_ORIGINS": "https://threatbridge.example.invalid",
                 "DJANGO_SECURE_HSTS_SECONDS": "31536000",
-                "DATABASE_URL": (
-                    "postgresql://threatbridge@database.example.invalid/threatbridge"
-                ),
+                "DATABASE_URL": ("postgresql://threatbridge@database.example.invalid/threatbridge"),
                 "THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS": "opencti.example.invalid",
                 "THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS": "10.20.0.0/16",
             }
@@ -146,7 +189,7 @@ class ProductionSettingsTests(SimpleTestCase):
             directory = Path(temporary_directory)
             secret_path = directory / "django-secret-key"
             database_path = directory / "database-url"
-            secret_path.write_text("file-backed-secret-" * 4, encoding="utf-8")
+            secret_path.write_text(SECOND_STRONG_TEST_SECRET_KEY, encoding="utf-8")
             database_path.write_text(
                 "postgresql://threatbridge@database.example.invalid/threatbridge\n",
                 encoding="utf-8",
@@ -274,13 +317,95 @@ class ProductionSettingsTests(SimpleTestCase):
         self.assertIn("HTTP_X_FORWARDED_PROTO", result.stdout)
 
     def test_rest_framework_uses_session_authentication_without_basic(self):
-        authentication = threatbridge_settings.REST_FRAMEWORK[
-            "DEFAULT_AUTHENTICATION_CLASSES"
-        ]
+        authentication = threatbridge_settings.REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]
         self.assertEqual(
             authentication,
             ["rest_framework.authentication.SessionAuthentication"],
         )
+
+    def test_hsts_preload_requires_a_completed_rollout(self):
+        cases = (
+            (
+                {"DJANGO_SECURE_HSTS_PRELOAD": "true"},
+                "DJANGO_SECURE_HSTS_PRELOAD requires",
+            ),
+            (
+                {
+                    "DJANGO_SECURE_HSTS_PRELOAD": "true",
+                    "DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS": "true",
+                    "DJANGO_SECURE_HSTS_SECONDS": "3600",
+                },
+                "DJANGO_SECURE_HSTS_PRELOAD requires",
+            ),
+            (
+                {
+                    "DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS": "true",
+                    "DJANGO_SECURE_HSTS_SECONDS": "0",
+                },
+                "has no effect while",
+            ),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                environment = self._production_environment()
+                environment.update(overrides)
+                result = self._import_settings(environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+
+    def test_fully_staged_hsts_preload_is_accepted(self):
+        environment = self._production_environment()
+        environment.update(
+            {
+                "DJANGO_SECURE_HSTS_SECONDS": "31536000",
+                "DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS": "true",
+                "DJANGO_SECURE_HSTS_PRELOAD": "true",
+            }
+        )
+        result = self._import_settings(environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_upload_limits_bound_the_request_body(self):
+        self.assertGreater(
+            threatbridge_settings.DATA_UPLOAD_MAX_MEMORY_SIZE,
+            threatbridge_settings.THREATBRIDGE_MAX_UPLOAD_BYTES,
+        )
+        self.assertLessEqual(
+            threatbridge_settings.FILE_UPLOAD_MAX_MEMORY_SIZE,
+            threatbridge_settings.THREATBRIDGE_MAX_UPLOAD_BYTES,
+        )
+        self.assertEqual(threatbridge_settings.FILE_UPLOAD_PERMISSIONS, 0o600)
+        self.assertEqual(threatbridge_settings.FILE_UPLOAD_DIRECTORY_PERMISSIONS, 0o700)
+        self.assertGreater(threatbridge_settings.DATA_UPLOAD_MAX_NUMBER_FIELDS, 0)
+        self.assertGreater(threatbridge_settings.DATA_UPLOAD_MAX_NUMBER_FILES, 0)
+
+    def test_api_throttling_is_configured_for_anonymous_and_authenticated_callers(self):
+        framework = threatbridge_settings.REST_FRAMEWORK
+        self.assertEqual(
+            framework["DEFAULT_THROTTLE_CLASSES"],
+            [
+                "rest_framework.throttling.AnonRateThrottle",
+                "rest_framework.throttling.UserRateThrottle",
+            ],
+        )
+        rates = framework["DEFAULT_THROTTLE_RATES"]
+        self.assertTrue(rates["anon"])
+        self.assertTrue(rates["user"])
+
+    def test_forwarded_host_and_port_headers_are_never_trusted(self):
+        self.assertFalse(threatbridge_settings.USE_X_FORWARDED_HOST)
+        self.assertFalse(threatbridge_settings.USE_X_FORWARDED_PORT)
+
+    def test_every_logging_handler_redacts_sensitive_data(self):
+        handlers = threatbridge_settings.LOGGING["handlers"]
+        self.assertTrue(handlers)
+        for name, handler in handlers.items():
+            with self.subTest(handler=name):
+                self.assertIn("redact_sensitive_data", handler["filters"])
+        for logger_name in ("gunicorn.access", "gunicorn.error"):
+            logger = threatbridge_settings.LOGGING["loggers"][logger_name]
+            self.assertEqual(logger["handlers"], ["console"])
+            self.assertFalse(logger["propagate"])
 
     def test_readiness_failure_is_generic(self):
         request = RequestFactory().get("/readyz")
@@ -292,3 +417,70 @@ class ProductionSettingsTests(SimpleTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertNotIn(b"secret", response.content)
         self.assertNotIn(b"error", response.content)
+
+
+class LogRedactionTests(SimpleTestCase):
+    def test_credential_bearing_log_lines_are_redacted(self):
+        value = REDACTION_FIXTURE_VALUE
+        cases = (
+            f"Authorization: Bearer {value}",
+            f'{{"Authorization": "Token {value}"}}',
+            f"Cookie: sessionid={value}",
+            f"set-cookie: csrftoken={value}; Path=/",
+            f"x-api-key={value}",
+            f"GET /api/x?api_token={value} HTTP/1.1",
+            f"GET /a?page=2&secret={value}&z=1 HTTP/1.1",
+            f"https://operator:{value}@opencti.example.invalid/graphql",
+            f"basic {value}",
+        )
+        for line in cases:
+            with self.subTest(line=line):
+                redacted = redact(line)
+                self.assertNotIn(value, redacted)
+                self.assertIn("<redacted>", redacted)
+
+    def test_redaction_preserves_non_sensitive_context(self):
+        redacted = redact("GET /api/integrations/?page=2 HTTP/1.1 200 1234")
+        self.assertEqual(redacted, "GET /api/integrations/?page=2 HTTP/1.1 200 1234")
+
+    def test_filter_rewrites_the_record_and_keeps_it(self):
+        record = logging.LogRecord(
+            name="gunicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="GET /api/x?token=%s HTTP/1.1",
+            args=("abcdef1234567890",),
+            exc_info=None,
+        )
+        self.assertTrue(SensitiveDataFilter().filter(record))
+        self.assertNotIn("abcdef1234567890", record.getMessage())
+        self.assertIn("<redacted>", record.getMessage())
+
+
+class RuntimeEntryPointTests(SimpleTestCase):
+    def _run_entry_point(self, module: str, environment: dict[str, str]):
+        return subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            cwd=threatbridge_settings.BASE_DIR,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_wsgi_and_asgi_refuse_to_start_without_an_explicit_debug_value(self):
+        for module in ("threatbridge.wsgi", "threatbridge.asgi"):
+            with self.subTest(module=module):
+                environment = os.environ.copy()
+                environment.pop("DJANGO_DEBUG", None)
+                result = self._run_entry_point(module, environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("DJANGO_DEBUG must be set explicitly", result.stderr)
+                self.assertIn("production_configuration.failed", result.stderr)
+
+    def test_wsgi_starts_when_debug_is_explicitly_declared(self):
+        environment = os.environ.copy()
+        environment["DJANGO_DEBUG"] = "true"
+        result = self._run_entry_point("threatbridge.wsgi", environment)
+        self.assertEqual(result.returncode, 0, result.stderr)

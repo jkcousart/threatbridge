@@ -1,15 +1,29 @@
+# Adds trust for one reviewed internal CA certificate. It never disables certificate
+# verification and never mounts a host certificate directory. The long syntax pins the
+# in-container path and a read-only, non-writable mode instead of relying on the
+# Compose default target location.
+x-extra-ca-config: &extra-ca-config
+  - source: threatbridge_extra_ca
+    target: /run/configs/threatbridge_extra_ca
+    uid: "65532"
+    gid: "65532"
+    mode: 0444
+
 services:
+  deploy-check:
+    environment:
+      THREATBRIDGE_EXTRA_CA_FILE: /run/configs/threatbridge_extra_ca
+    configs: *extra-ca-config
+
   migrate:
     environment:
       THREATBRIDGE_EXTRA_CA_FILE: /run/configs/threatbridge_extra_ca
-    configs:
-      - threatbridge_extra_ca
+    configs: *extra-ca-config
 
   web:
     environment:
       THREATBRIDGE_EXTRA_CA_FILE: /run/configs/threatbridge_extra_ca
-    configs:
-      - threatbridge_extra_ca
+    configs: *extra-ca-config
 
 configs:
   threatbridge_extra_ca:
