@@ -67,6 +67,12 @@ def _configured_file_path(name: str) -> str | None:
             raise ImproperlyConfigured(
                 f"{name} must not be group- or world-writable"
             )
+        # stat succeeds on a file this process cannot read, and a mounted file often
+        # carries the host owner's mode rather than the container user's. Read it here so
+        # an unreadable trust anchor or secret fails at startup instead of silently
+        # degrading later, when the only symptom is a failed outbound connection.
+        with path.open("rb") as handle:
+            handle.read(1)
     except OSError as exc:
         raise ImproperlyConfigured(f"Unable to read {name}") from exc
     return str(path)
@@ -452,6 +458,11 @@ if not DEBUG:
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SECURE_SSL_REDIRECT = True
+    # The container health check probes loopback over plain HTTP and cannot follow a
+    # redirect to the public hostname. Both endpoints return a fixed status string and no
+    # configuration detail, so exempting only these two paths keeps the redirect in force
+    # everywhere that carries data.
+    SECURE_REDIRECT_EXEMPT = [r"^healthz$", r"^readyz$"]
     if _environment_boolean("DJANGO_TRUST_X_FORWARDED_PROTO", False):
         SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 

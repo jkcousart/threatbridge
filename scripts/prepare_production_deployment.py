@@ -16,9 +16,27 @@ DEFAULT_ENV = ROOT / "deploy" / ".env.production"
 DEFAULT_SECRETS = ROOT / "deploy" / "secrets"
 
 
+# Compose outside swarm bind-mounts a file-backed secret with the host file's ownership
+# and mode, and ignores the `uid`, `gid`, and `mode` options. The container runs as
+# 65532, which cannot be chowned to without root, so the file itself has to be
+# world-readable for the application to read its own secret. Confidentiality therefore
+# rests on the 0700 secrets directory: no unprivileged host user can traverse into it, so
+# the permissive file mode is unreachable. SECRET_FILE_MODE is read-only for everyone,
+# which also stops the container from rewriting its own credentials.
+SECRET_DIRECTORY_MODE = 0o700
+SECRET_FILE_MODE = 0o444
+
+
+def ensure_secret_directory(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True, mode=SECRET_DIRECTORY_MODE)
+    directory.chmod(SECRET_DIRECTORY_MODE)
+    mode = stat.S_IMODE(directory.stat().st_mode)
+    if mode != SECRET_DIRECTORY_MODE:
+        raise SystemExit(f"Refusing secrets directory {directory} with mode {mode:o}; expected 700")
+
+
 def ensure_secret(path: Path, value: str, *, force: bool) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.parent.chmod(0o700)
+    ensure_secret_directory(path.parent)
     if path.is_symlink():
         raise SystemExit(f"Refusing symlink secret path: {path}")
     if path.exists() and not force:
@@ -26,11 +44,15 @@ def ensure_secret(path: Path, value: str, *, force: bool) -> str:
         if not stat.S_ISREG(metadata.st_mode):
             raise SystemExit(f"Refusing non-regular secret path: {path}")
         mode = stat.S_IMODE(metadata.st_mode)
-        if mode & 0o077:
-            raise SystemExit(f"Refusing insecure existing secret permissions on {path}: {mode:o}")
+        # Readable is required; writable by anyone other than the owner is not.
+        if mode & 0o022:
+            raise SystemExit(f"Refusing writable existing secret permissions on {path}: {mode:o}")
         existing = path.read_text(encoding="utf-8").strip()
         if not existing:
             raise SystemExit(f"Refusing empty existing secret: {path}")
+        # Re-mode an existing secret created before the container-readable policy so an
+        # in-place upgrade does not silently keep failing at startup.
+        path.chmod(SECRET_FILE_MODE)
         return existing
     open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
@@ -39,7 +61,7 @@ def ensure_secret(path: Path, value: str, *, force: bool) -> str:
     with os.fdopen(descriptor, "w", encoding="utf-8") as secret_file:
         secret_file.write(value)
         secret_file.write("\n")
-    path.chmod(0o600)
+    path.chmod(SECRET_FILE_MODE)
     return value
 
 
@@ -172,6 +194,21 @@ def main() -> None:
         extra_ca_path = args.extra_ca_path.expanduser().resolve()
         if not extra_ca_path.is_file() or extra_ca_path.is_symlink():
             raise SystemExit("--extra-ca-path must be an existing regular non-symlink file")
+        # Compose mounts this file with the host mode and ignores the overlay's uid/gid/
+        # mode, so an operator-only mode leaves the container unable to load the trust
+        # anchor. A CA certificate is public material, so world-readable costs nothing.
+        ca_mode = stat.S_IMODE(extra_ca_path.stat().st_mode)
+        if not ca_mode & 0o004:
+            raise SystemExit(
+                f"--extra-ca-path {extra_ca_path} has mode {ca_mode:o} and would not be "
+                "readable by the container user 65532; run "
+                f"chmod 0444 {extra_ca_path} (a CA certificate is not secret)"
+            )
+        if ca_mode & 0o022:
+            raise SystemExit(
+                f"--extra-ca-path {extra_ca_path} has mode {ca_mode:o}; it must not be "
+                "group- or world-writable"
+            )
         replacements["THREATBRIDGE_EXTRA_CA_PATH"] = str(extra_ca_path)
     for key, value in replacements.items():
         source = replace_env_value(source, key, value)

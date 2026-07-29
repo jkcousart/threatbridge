@@ -201,19 +201,179 @@ Hardened, mirrored, and private registry overrides are unchanged and still suppo
 patch-level Alpine tag rather than a floating `python:3.13-slim`, which also brings it in line with the
 documented requirement in `docs/supply-chain.md` to select an exact patch tag.
 
-#### What this does not yet establish
+#### What this did not yet establish
 
-The Alpine evidence comes from a locally built comparison candidate, not from the committed default.
-Two things must happen before a prebuilt image can be called ready:
-
-1. **Rebuild from the committed default** — `docker build --no-cache` with no `--build-arg` override —
-   and rerun validation, SBOM generation, and scanning against that exact image ID. Evidence from a
-   comparison build is not evidence about the committed artifact.
-2. **Exercise the production Compose stack end to end** against that image, confirming the
-   `deploy-check` gate, migrations, PostgreSQL connectivity, and readiness.
+At the time of the base-image change, the Alpine evidence came from a locally built comparison
+candidate rather than from the committed default. Two things were still outstanding: a rebuild from
+the committed default with no `--build-arg` override, and an end-to-end run of the production Compose
+stack. Both were then carried out and are recorded in the following section.
 
 Generated reports for these runs stay in the ignored `release-evidence/` directory and are not
 committed. Source-repository publication and prebuilt-image publication remain separate decisions.
+
+### Follow-up: production Compose integration test (2026-07-29)
+
+Docker Desktop 29.6.1 with Compose v5.3.0 became available, so the committed default was rebuilt and
+the production profile was run end to end for the first time. **The rebuild and image validation
+passed, and the Compose run then exposed six defects that no amount of static review had caught.**
+Three of them made the documented deployment path unusable, and one silently disabled a security
+feature. All six are fixed and re-verified below.
+
+#### Committed-default rebuild
+
+`docker build --no-cache` with no `--build-arg` override, followed by
+`scripts/validate_container_image.sh`, `scripts/generate_image_sbom.sh`, and
+`scripts/scan_container_image.sh` against that exact image ID:
+
+| Step | Result |
+| --- | --- |
+| Build from committed default | Pass. `org.opencontainers.image.base.name` reads `python:3.13.14-alpine3.24@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0`. |
+| Installed-wheel and confinement validation | Pass. UID/GID 65532, all three packages resolved under `/opt/runtime-venv/lib/python3.13/site-packages`, `pip` absent, `NoNewPrivs` set, capability sets empty, read-only root, only `8000/tcp` exposed. |
+| CycloneDX image SBOM | Generated for the exact image ID, including OS packages. |
+| Trivy 0.70.0 image scan | Pass. Zero HIGH and zero CRITICAL. Alpine 3.24.1, 29 OS packages. |
+
+This closes the first outstanding condition: the scanned artifact is now the one a third party gets
+from a plain `docker build`, not a comparison candidate.
+
+#### Defect 1 — the production profile was not a loadable Compose project
+
+`docker compose config` failed outright:
+
+```
+services.db: can't set distinct values on 'pids_limit' and 'deploy.resources.limits.pids'
+```
+
+Every application service and the database set `pids_limit` alongside `deploy.resources.limits`
+without a `pids` entry. Compose treats the absent `deploy.resources.limits.pids` as `0`, compares it
+against `pids_limit`, and rejects the project. **The documented production deployment could not
+start at all.** The PID limits added during this audit introduced it, and the existing tests could
+not see it because they parse the YAML directly and never invoke Compose.
+
+Three variants were measured against Compose v5.3.0. `pids_limit` beside `deploy.resources.limits`
+with no `pids` is rejected; `deploy.resources.limits.pids` alone is accepted; both keys with equal
+values are accepted. Inspecting a running container confirmed that either accepted form applies
+`HostConfig.PidsLimit` in plain non-Swarm `compose up`.
+
+Both keys are now declared from a single YAML anchor per service. Keeping `pids_limit` matters
+because Compose releases that ignore `deploy` outside Swarm would otherwise drop the limit silently,
+and losing a security limit is worse than writing the number in two places; the anchor makes drift
+impossible.
+
+#### Defect 2 — secret files were unreadable by the container user
+
+With the project loadable, the `deploy-check` gate failed:
+
+```
+django.core.exceptions.ImproperlyConfigured: Unable to read DJANGO_SECRET_KEY_FILE
+```
+
+`scripts/prepare_production_deployment.py` created secrets mode `0600` owned by the operator, and the
+container runs as UID 65532. Outside Swarm, Compose bind-mounts a file-backed secret with the host
+file's ownership and mode and **ignores the `uid`, `gid`, and `mode` options**, printing `config uid,
+gid and mode are not supported, they will be ignored`. This was verified directly: inside the
+container the files appeared as `-rw------- 1000 1000` and reading one returned `Permission denied`.
+The whole documented secret-injection flow was therefore incompatible with the non-root image.
+
+Secrets are now written mode `0444` inside the `0700` secrets directory. The directory is the real
+boundary — no unprivileged host user can traverse into it, so the permissive file mode is
+unreachable — and a read-only file also stops the container from rewriting its own credentials. The
+script verifies the directory mode on every run, refuses any group- or world-writable secret, and
+re-applies the mode to existing secrets so an in-place upgrade is repaired without rotating values.
+
+The gate behaving this way is itself the fail-closed evidence: an unreadable secret stopped
+`deploy-check`, which stopped `migrate`, which stopped `web`. Nothing served with a broken
+configuration.
+
+#### Defect 3 — the container could never report healthy
+
+With secrets readable, the stack started and `web` went `unhealthy`. The probe requested
+`http://127.0.0.1:8000/readyz`, which sends `Host: 127.0.0.1`, and `ALLOWED_HOSTS` contains the
+operator's hostname, so Django answered `400` and logged `DisallowedHost`. Correcting the `Host`
+header then surfaced a second layer: `SECURE_SSL_REDIRECT` answered `301` to
+`https://<hostname>/readyz`, which a loopback probe cannot follow.
+
+Both layers are fixed without weakening either control:
+
+- The image probe sends the first entry of `DJANGO_ALLOWED_HOSTS` as its `Host` header. `ALLOWED_HOSTS`
+  was **not** widened to accept loopback; an unrecognised `Host` is still answered with `400`.
+- `SECURE_REDIRECT_EXEMPT` is limited to `^healthz$` and `^readyz$`. Both return a fixed status
+  string and no configuration detail. Verified live: `/readyz` and `/healthz` return `200` over plain
+  HTTP while `/` and `/admin/` still return `301` to `https://<hostname>/`.
+
+#### Defect 4 — the Compose health check silently overrode the image probe
+
+Fixing the `Dockerfile` changed nothing at first, because both Compose profiles redefined
+`healthcheck.test` with their own copy of the probe. The image's `HEALTHCHECK` was never used, so the
+two definitions had drifted apart unnoticed.
+
+Both profiles now omit `test` and override only the timings. Compose was measured to inherit the
+image's probe command in that configuration, so the probe is defined once in the `Dockerfile` and a
+fix there cannot be shadowed. After this change `web` reported healthy in about nine seconds in both
+the production and development profiles.
+
+#### Defect 5 — the private-CA overlay mounted a certificate the application could not read
+
+This is the one that failed silently. Running with `THREATBRIDGE_USE_EXTRA_CA=true` and a mode-`0600`
+certificate, the stack reported **healthy** while the mounted file was unreadable:
+`UNREADABLE: [Errno 13] Permission denied: '/run/configs/threatbridge_extra_ca'`. The overlay
+declares `uid`, `gid`, and `mode`, and Compose ignores all three for configs exactly as it does for
+secrets. `_configured_file_path` validated the path's metadata — which succeeds on a file the process
+cannot read — but never read it, so the private CA was simply absent from the trust store with no
+error anywhere. An operator would have believed private-CA verification was active.
+
+Two changes:
+
+- `_configured_file_path` now reads one byte from every configured file, so an unreadable secret or
+  trust anchor fails at startup instead of degrading silently. Verified live: the `deploy-check` gate
+  now refuses with `Unable to read THREATBRIDGE_EXTRA_CA_FILE`.
+- `scripts/prepare_production_deployment.py` refuses a certificate that UID 65532 could not read and
+  names the `chmod` to run. A CA certificate is public material, so a readable mode costs nothing.
+
+With the certificate at `0444`, the trust store was confirmed to contain 120 entries including the
+test CA, so the private CA is genuinely loaded and public trust is extended rather than replaced.
+
+#### Defect 6 — the deployment gate was attaching to an implicit network
+
+Rendering the configuration also showed `deploy-check` on a Compose-created `default` bridge with
+outbound access, because omitting the `networks` key does not mean "no network". The service reads
+configuration only, so it now sets `network_mode: none`. Verified live: the gate runs with `net=none`,
+exits `0`, and the implicit `default` network is no longer created.
+
+#### Live verification after the fixes
+
+The full production profile was brought up against the committed-default image. `deploy-check` exited
+`0`, migrations applied, PostgreSQL reported healthy, and `web` reported healthy.
+
+| Property | Observed |
+| --- | --- |
+| Effective user | `65532:65532` |
+| Root filesystem | `ReadonlyRootfs=true`; `/` mounted `ro`; writes to `/app`, `/opt/runtime-venv`, `/etc`, `/usr/local/lib`, and `/` all refused |
+| Writable paths | Exactly `/tmp` and `/app/data` |
+| `/tmp` mount options | `rw,nosuid,nodev,noexec,size=65536k` |
+| Capabilities | `CapPrm`, `CapEff`, `CapBnd` all `0000000000000000` |
+| Privilege escalation | `NoNewPrivs: 1`; `Seccomp: 2` |
+| Limits applied | `PidsLimit=256`, `NanoCpus=2000000000`, `Memory=1073741824` |
+| Namespaces | No host PID, IPC, UTS, or network namespace; `IpcMode=private` |
+| Docker socket | Absent |
+| Mounts | Only `threatbridge-data:/app/data`; both secrets mounted `ro` |
+| Published port | `127.0.0.1:18020->8000/tcp`; host listener bound to `127.0.0.1` only |
+| Database exposure | No published port; not reachable from the host |
+| Network segmentation | `database` network `internal=true`, and the database container has no external DNS resolution; `web` reaches `db:5432` internally and retains egress for connectors |
+| `deploy-check` network | `none` |
+| Logging | `json-file`, `max-size=10m`, `max-file=5` |
+| Restart policy | `unless-stopped` |
+| Host `Host`-header policy | Configured host returns `200`; `Host: evil.example.com` returns `400` |
+
+#### What this establishes and what it does not
+
+Both previously outstanding conditions are now met: the committed default was rebuilt, validated,
+SBOM'd, and scanned clean, and the production Compose stack ran end to end with confinement verified
+against live containers. The scan result remains point-in-time evidence about one image and one
+scanner database on 2026-07-29.
+
+This run used a disposable environment file, throwaway secrets, a `.invalid` outbound host, and a
+self-signed test CA. No live credential or production connector was involved, and no connector
+synchronisation was exercised against a real endpoint. Restore-from-backup was not exercised.
 
 ## Findings by severity
 
@@ -230,6 +390,9 @@ baseline was already substantially hardened; these are the gaps found and closed
 | H-4 | `SECRET_KEY` was required in production but unvalidated. A short, repeated, or copy-pasted placeholder key was accepted, undermining session and CSRF signing. | Production keys must be at least 50 characters with at least 16 distinct characters and must not contain any of 15 placeholder markers. |
 | H-5 | Credentials could reach logs. No handler redacted anything, and Gunicorn's access log records full request lines, so a token in a query string was written verbatim. | `threatbridge/log_redaction.SensitiveDataFilter` is attached to every handler, including explicit `gunicorn.access` and `gunicorn.error` loggers. It removes URL userinfo, `Authorization` and `Cookie` header values, `Bearer`/`Basic`/`Token` credentials, and sensitive query parameters. `threatbridge.E003` fails the deployment check if any handler omits it. |
 | H-6 | The development profile published `8000` on every host interface, so `docker compose up` on a laptop or lab host exposed a `DEBUG=True` instance with a well-known database password to the whole network. | The port is now bound to `127.0.0.1`, and the service runs unprivileged with all capabilities dropped and `no-new-privileges`. |
+| H-7 | Found by live execution. The PID limits added by this audit made `compose.production.yml` an invalid Compose project: `pids_limit` beside `deploy.resources.limits` without a `pids` entry is rejected, so the documented production deployment could not start at all. | Each PID ceiling is declared as both keys from one YAML anchor. `test_production_compose_is_a_valid_compose_project` now runs `docker compose config` and reproduces the original error when either key is removed. |
+| H-8 | Found by live execution. `prepare_production_deployment.py` wrote secrets mode `0600` owned by the operator, but Compose ignores `uid`/`gid`/`mode` outside Swarm and mounts host ownership as-is, so UID 65532 could not read them and startup aborted. The documented secret-injection flow was incompatible with the non-root image. | Secrets are written `0444` inside the `0700` secrets directory, which is the actual host boundary. The directory mode is verified on every run, group- or world-writable secrets are refused, and existing secrets are re-moded without rotation. |
+| H-9 | Found by live execution. The container health check requested `http://127.0.0.1:8000/readyz`, so Django rejected `Host: 127.0.0.1` with `400`; correcting that exposed a `301` from `SECURE_SSL_REDIRECT` that a loopback probe cannot follow. The container could never report healthy. | The probe sends the first `DJANGO_ALLOWED_HOSTS` entry as its `Host` header, and `SECURE_REDIRECT_EXEMPT` covers only `^healthz$` and `^readyz$`. `ALLOWED_HOSTS` was not widened and every data-carrying path still redirects. |
 
 ### Medium
 
@@ -247,6 +410,8 @@ baseline was already substantially hardened; these are the gaps found and closed
 | M-10 | No workflow scanned the container image or the repository for secrets or Dockerfile misconfiguration. | `.github/workflows/container-scan.yml` runs a Trivy secret scan, a Trivy configuration scan, an image build, `validate_container_image.sh`, and `scan_container_image.sh`, which fails on any HIGH or CRITICAL image finding. |
 | M-11 | `scripts/compare_base_images.sh` recorded a blocked or skipped scan and still exited zero, so evidence collection could be mistaken for approval. | It now exits non-zero unless every candidate's scan policy is `pass`. |
 | M-12 | Authorization tests covered successful paths and a subset of denials. Several state-changing endpoints had no test proving they refuse an authenticated caller without the required permission. | Three parameterised denial tests now cover every state-changing endpoint on both the browser and API surfaces, restricted-evidence reads, and anonymous mutations. |
+| M-13 | Found by live execution. The private-CA overlay mounted the certificate with the host's owner-only mode, so the application could not read it, and `_configured_file_path` validated metadata without reading the file. The stack reported healthy while the private CA was silently absent from the trust store, so an operator would have believed private-CA verification was active. | Every configured file is now read at startup, so an unreadable trust anchor or secret fails closed at the `deploy-check` gate. `prepare_production_deployment.py` refuses a certificate UID 65532 could not read and names the required `chmod`. |
+| M-14 | Found by live execution. Both Compose profiles redefined `healthcheck.test`, overriding the image's `HEALTHCHECK`, so the two copies had drifted and a fix in the `Dockerfile` had no effect. | Both profiles omit `test` and tune only the timings, so the probe is defined once in the image. A test asserts `test` stays absent. |
 
 ### Low
 
@@ -262,6 +427,7 @@ baseline was already substantially hardened; these are the gaps found and closed
 | L-8 | `tests/test_release_tooling.py` asserted a hard-coded workflow count, so adding a security workflow broke it and removing one did not. | It validates whatever is on disk, asserts the security-relevant workflows exist, and asserts no step swallows a failure. |
 | L-9 | `docs/release-validation.md` described a runtime user and interpreter paths that no longer match the image, and its scan counts read as current. | A status header marks it as point-in-time evidence and identifies exactly which statements are superseded. The historical numbers were not rewritten. |
 | L-10 | Public documentation did not state the malware-sandbox boundary, the limits of container isolation, or the split between repository-enforced and host-enforced controls. | All three are stated in `README.md`, `SECURITY.md`, `docs/security-architecture.md`, and `docs/deployment-hardening.md`, which now carries a responsibility matrix and a residual-risk list. |
+| L-11 | Found by live execution. `deploy-check` declared no networks, which attaches a service to the implicit Compose default bridge rather than isolating it, so the configuration-only gate had outbound access it never uses. | The service sets `network_mode: none`, and the implicit `default` network is no longer created. |
 
 ### Informational — verified, no change required
 
@@ -332,6 +498,22 @@ full-SHA action pins; and no `pull_request_target` and no workflow consuming a s
   value instead of embedding a high-entropy literal, which removed four Gitleaks findings in the
   candidate tree without weakening any assertion.
 
+From the Compose integration test:
+
+- Secret files are now created mode `0444` rather than `0600`, inside the same `0700` directory.
+  Re-running `prepare_production_deployment.py` repairs an existing deployment's modes in place
+  without rotating the values. An operator who injects secrets by another mechanism must ensure the
+  files are readable by UID 65532 and that the containing directory is not world-traversable.
+- A private CA certificate passed through `--extra-ca-path` must be mode `0444`. The preparation
+  script now refuses an unreadable certificate instead of producing a configuration that mounts one
+  the application cannot read.
+- Any configured `*_FILE` path that the application cannot read now fails at startup rather than
+  being silently ignored. A deployment that was unknowingly running without its private CA in the
+  trust store will begin refusing to start, which is the intended correction.
+- `/healthz` and `/readyz` are no longer redirected to HTTPS in production. Every other path is
+  unchanged. A reverse proxy that relied on receiving a `301` from these two paths will now receive
+  `200`.
+
 ## Test and scanner outcomes
 
 Tool versions: Python 3.14.4 (host), Django 6.0.7, pytest 9.1.1, Ruff 0.15.22, Bandit 1.9.4,
@@ -339,7 +521,7 @@ pip-audit 2.10.1, Trivy 0.70.0, Gitleaks (build-stamped version string).
 
 | Check | Result |
 | --- | --- |
-| `python -m pytest` | **Pass** — 213 passed, 130 subtests passed (baseline: 180 passed) |
+| `python -m pytest` | **Pass** — 232 passed, 130 subtests passed (baseline: 180 passed) |
 | `python manage.py check` | **Pass** — no issues |
 | `python manage.py makemigrations --check --dry-run` | **Pass** — no changes detected |
 | `manage.py check --deploy --fail-level ERROR` (synthetic production) | **Pass** — exit 0, one informational `security.W021` HSTS-preload notice |
@@ -356,12 +538,14 @@ pip-audit 2.10.1, Trivy 0.70.0, Gitleaks (build-stamped version string).
 | Gitleaks, candidate tree | **Pass** — no leaks |
 | Gitleaks, all 14 reachable commits | **Pass** — no leaks |
 | SBOM regeneration byte-comparison | **Pass** — matches `sbom/threatbridge.cdx.json` |
-| `docker compose config` (both profiles) | **Not run** — no Docker daemon available during the audit pass |
+| `docker compose config` (both profiles) | **Pass, after one fix** — the first live run rejected the project because `pids_limit` sat beside `deploy.resources.limits` without a matching `pids` entry. With both keys anchored to one value, the base profile and the step-ca overlay both render. See [Follow-up: production Compose integration test](#follow-up-production-compose-integration-test-2026-07-29). |
 | Image build | **Pass, after one fix** — the first attempt failed because the builder working directory shadowed the installed wheel and the wheel validation correctly refused it. With `python -P` the image builds on Docker Desktop and the installed-wheel validation passes. See [Follow-up: live build attempt](#follow-up-live-build-attempt-2026-07-29). |
 | `validate_container_image.sh` | **Pass, after one fix** — a blank-record parsing bug produced a false `" 8000/tcp"` mismatch. With the parser corrected and the exact-port policy intact, the validator runs to completion and every confinement assertion passes on the live image. |
 | `generate_image_sbom.sh` | **Pass** — CycloneDX image SBOM produced for the exact image ID |
 | `scan_container_image.sh` | **Blocked on Debian, passes on Alpine** — the Debian 13 candidate recorded 23 blocking findings (4 CRITICAL, 19 HIGH) and Debian 12 Bookworm 24 (6 CRITICAL, 18 HIGH); the Alpine 3.24 candidate recorded 0 CRITICAL and 0 HIGH and is now the committed default. See [Follow-up: confinement validation, scanning, and base-image selection](#follow-up-confinement-validation-scanning-and-base-image-selection-2026-07-29). |
-| Rebuild from the committed default; production Compose stack | **Pending** — the Alpine evidence comes from a comparison build, not from the committed default |
+| Rebuild from the committed default | **Pass** — built with no `--build-arg` override; base label confirms the committed Alpine digest; validation, SBOM, and scan all run against that exact image ID, with zero HIGH and zero CRITICAL |
+| Production Compose stack, end to end | **Pass, after six fixes** — `deploy-check` exit 0, migrations applied, PostgreSQL healthy, `web` healthy in about nine seconds, and every confinement property verified against live containers. The six defects found are recorded as H-7, H-8, H-9, M-13, M-14, and L-11. |
+| Development Compose profile | **Pass** — `web` healthy, `/readyz` returns 200, image probe inherited |
 
 ### Fail-closed behaviour verified by execution
 
@@ -383,8 +567,9 @@ outcome: the process cannot reach a serving state at all.
 
 ## Docker runtime controls
 
-Asserted statically and by `tests/test_deployment_tooling.py`, and asserted at runtime by
-`scripts/validate_container_image.sh` when a Docker daemon is available:
+Asserted statically and by `tests/test_deployment_tooling.py`, asserted at runtime by
+`scripts/validate_container_image.sh`, and — as of the Compose integration test above — observed on
+live containers running the committed default:
 
 | Control | Production profile | Verified by |
 | --- | --- | --- |
@@ -395,16 +580,17 @@ Asserted statically and by `tests/test_deployment_tooling.py`, and asserted at r
 | Writable paths | `/tmp` tmpfs (64 MiB, `noexec,nosuid,nodev`) and the `/app/data` named volume only | Compose test; write probes |
 | No Docker socket, host namespace, host root, `/proc`, `/sys`, `/dev` | Absent everywhere | Compose test; mount inspection |
 | `init: true` | Every service | Compose test |
-| `pids_limit`, CPU and memory limits | Every service | Compose test |
-| Health check | `web` and `db` | Compose test |
+| `pids_limit`, CPU and memory limits | Every service | Compose test; `HostConfig.PidsLimit`, `NanoCpus`, and `Memory` observed on a running container |
+| Health check | `web` and `db` | Compose test; `web` observed healthy |
+| Network isolation of the deployment gate | `deploy-check` runs with `network_mode: none` | Compose test; `HostConfig.NetworkMode=none` observed |
 | Exposed ports | `8000/tcp` only in the image; published only on an explicitly configured host address | Compose test; `Config.ExposedPorts` assertion |
 | No published database port; internal network | Enforced | Compose test |
 | Log rotation | `json-file` with size and file caps | Compose test |
 | OCI labels | Complete set | Label assertion |
-| Fails closed without production secrets | Verified by execution outside Docker | Fail-closed section above |
+| Fails closed without production secrets | Verified by execution outside Docker, and by the `deploy-check` gate refusing an unreadable secret inside Docker | Fail-closed section above |
 
-The runtime column is a contract the validation script enforces on a Docker host, not an observation
-made during this audit.
+Every row in this table has now been observed on a live container built from the committed default,
+rather than only asserted.
 
 ## Git history and public-data review
 
@@ -431,11 +617,13 @@ made during this audit.
 
 ## Remaining risks
 
-1. **The committed default has not been rebuilt and revalidated.** Container confinement is now
-   observed rather than asserted, but on a comparison build. The Alpine default must be rebuilt with
-   no `--build-arg` override and put through validation, SBOM generation, and scanning as that exact
-   artifact, and the production Compose stack must be exercised end to end against it. This is the
-   primary condition on the recommendation.
+1. **Static review did not predict how the deployment would behave.** Six defects survived a full
+   static audit and were found only by running the stack, three of which prevented it from starting
+   and one of which silently disabled private-CA trust. Two lessons are now encoded in tests — the
+   Compose project is validated by Compose itself rather than by parsing YAML, and configured files
+   are read rather than merely stat'ed — but the general point stands: for this project, a change to
+   the Compose profile, the image, or the secret contract is not verified until it has been run. The
+   CI container workflow builds and validates the image; it does not bring up the Compose stack.
 2. **The clean base scan is point-in-time.** The Alpine 3.24 default recorded 0 CRITICAL and 0 HIGH
    under Trivy 0.70.0 on 2026-07-29. Operating-system packages acquire advisories over time, so that
    result must be reproduced by rescanning rather than assumed. ThreatBridge is not certified and is
@@ -465,6 +653,14 @@ made during this audit.
     vulnerability can defeat the profile.
 12. **The workflows have never run on GitHub.** Hosted permissions, CodeQL availability, and
     Dependabot behaviour cannot be proven locally.
+13. **Secret confidentiality depends on a directory mode, not a file mode.** Because Compose ignores
+    `uid`, `gid`, and `mode` outside Swarm, the secret files are world-readable and the `0700` secrets
+    directory is what protects them. An operator who relocates the secrets into a world-traversable
+    path, loosens the directory, or copies the files elsewhere loses that protection. Swarm, Kubernetes,
+    or an external secret manager avoids the trade-off entirely.
+14. **The integration test used synthetic inputs.** No live credential, real connector endpoint, or
+    production dataset was involved, and connector synchronisation and restore-from-backup were not
+    exercised against a real system.
 
 ## Items requiring repository-owner configuration in GitHub
 
@@ -551,6 +747,56 @@ docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.
 ./scripts/scan_container_image.sh threatbridge-release-candidate:local
 ```
 
+To reproduce the production Compose integration test, in a disposable directory outside the
+repository. Nothing below uses a live credential or a real connector endpoint:
+
+```bash
+test_root="$(mktemp -d)"; chmod 700 "${test_root}"
+
+python scripts/prepare_production_deployment.py \
+    --hostname threatbridge.localhost \
+    --bind-address 127.0.0.1 \
+    --outbound-host opencti.example.invalid \
+    --port 18020 \
+    --hsts-seconds 0 \
+    --env-file "${test_root}/.env.production" \
+    --secrets-dir "${test_root}/secrets"
+
+# Expect 0700 on the directory and 0444 on each secret: the container user must be able
+# to read them, and the directory is what keeps them confidential.
+stat -c '%a %n' "${test_root}/secrets" "${test_root}"/secrets/*
+
+THREATBRIDGE_ENV_FILE="${test_root}/.env.production" \
+    bash scripts/resolve_production_images.sh
+
+# Must exit 0. A non-zero exit here means the profile is not a loadable project.
+THREATBRIDGE_ENV_FILE="${test_root}/.env.production" \
+    ./scripts/production_compose.sh -p tb-it config --quiet
+
+THREATBRIDGE_ENV_FILE="${test_root}/.env.production" \
+    ./scripts/production_compose.sh -p tb-it up -d
+
+# deploy-check and migrate must both exit 0, and web must reach "healthy".
+THREATBRIDGE_ENV_FILE="${test_root}/.env.production" \
+    ./scripts/production_compose.sh -p tb-it ps -a
+
+# Health endpoints answer over plain HTTP; every data path still redirects to HTTPS;
+# an unrecognised Host is still refused.
+curl -si -H 'Host: threatbridge.localhost' http://127.0.0.1:18020/readyz | head -1
+curl -si -H 'Host: threatbridge.localhost' http://127.0.0.1:18020/admin/ | head -1
+curl -si -H 'Host: evil.example.com'       http://127.0.0.1:18020/readyz | head -1
+
+# Live confinement of the serving container.
+docker inspect --format 'ro={{.HostConfig.ReadonlyRootfs}} user={{.Config.User}}
+caps={{.HostConfig.CapDrop}} opt={{.HostConfig.SecurityOpt}}
+pids={{.HostConfig.PidsLimit}} net={{.HostConfig.NetworkMode}}' tb-it-web-1
+docker exec tb-it-web-1 grep -E 'NoNewPrivs|CapEff' /proc/1/status
+
+THREATBRIDGE_ENV_FILE="${test_root}/.env.production" \
+    ./scripts/production_compose.sh -p tb-it down -v
+rm -rf "${test_root}"
+```
+
 ## Recommendation
 
 **READY WITH DOCUMENTED CONDITIONS** for publication of the reviewed source repository.
@@ -561,32 +807,38 @@ deployment checks under a synthetic production environment, dependency-lock and 
 and Gitleaks against both the candidate tree and all reachable history. No secret exists in the tree
 or in history, no history rewrite is needed, and every fail-closed guard was proven by execution.
 
-Container runtime confinement is now **observed rather than asserted**: the validator ran to completion
-against a live image and proved the non-root identity, read-only root filesystem, empty capability
-sets, `NoNewPrivs=1`, `/tmp`-only writability, absent Docker socket, authoritative installed wheel, and
-single exposed port. The default base was moved to the Alpine 3.24 candidate that recorded zero HIGH or
-CRITICAL findings under the reviewed Trivy 0.70.0 policy.
+Container runtime confinement is now **observed rather than asserted, on the committed default**. The
+image was rebuilt with no `--build-arg` override, validated, SBOM'd, and scanned clean, and the
+production Compose stack ran end to end with every confinement property read off live containers: the
+non-root identity, read-only root filesystem, `/tmp`-and-`/app/data`-only writability, empty
+capability sets, `NoNewPrivs=1`, applied PID and resource limits, absent Docker socket, loopback-only
+published port, unpublished and egress-free database, and authoritative installed wheel. The default
+base is the Alpine 3.24 candidate that recorded zero HIGH or CRITICAL findings under the reviewed
+Trivy 0.70.0 policy.
 
-READY is withheld because that evidence belongs to comparison builds rather than to the committed
-default. **A prebuilt image is explicitly not READY.** Two outstanding items are gaps in evidence
-rather than known defects, and both are mechanical.
+That run also found six defects, three of which prevented the documented deployment from starting and
+one of which silently disabled private-CA trust. All are fixed and re-verified, and the two most
+significant gaps in the test strategy are now closed — Compose validates its own project, and
+configured files are read rather than stat'ed.
+
+READY is withheld for the reasons below, none of which is a known defect in the reviewed code. **A
+prebuilt image is explicitly not READY**, because publishing an image is a durable claim about
+vulnerability status and the clean scan is a single point-in-time observation.
 
 ### Conditions before publication
 
-1. On a host with Docker, rebuild from the committed default — `docker build --no-cache` with no
-   `--build-arg` override — then run `scripts/validate_container_image.sh`,
-   `scripts/generate_image_sbom.sh`, and `scripts/scan_container_image.sh` against that exact image ID.
-   All must pass, including the hardened validation run that proves a non-root UID, read-only root
-   filesystem, empty capability set, `NoNewPrivs=1`, a writable `/tmp`, no Docker socket, and the
-   single expected exposed port.
-2. Start the production Compose stack end to end against that image and confirm the `deploy-check`
-   gate, migrations, PostgreSQL connectivity, and readiness, plus the Compose commands above.
-3. Re-resolve the base-image digests and rerun the unsuppressed image scan immediately before release,
-   since the clean Alpine result is point-in-time. Prebuilt-image publication stays blocked while any
-   HIGH or CRITICAL finding is unfixed; source publication is a separate decision.
-4. Apply the GitHub repository settings listed above, then confirm every workflow succeeds on the
-   public host.
-5. Have an independent reviewer confirm private-file exclusion and this evidence, per
+1. Re-resolve the base-image digests and rerun the unsuppressed image scan immediately before
+   release, since the clean Alpine result is point-in-time evidence from 2026-07-29. Prebuilt-image
+   publication stays blocked while any HIGH or CRITICAL finding is unfixed; source publication is a
+   separate decision.
+2. Repeat the committed-default rebuild and the Compose integration test on the release commit, using
+   the commands above. The integration test recorded here ran on the working tree that became this
+   commit, and five of the defects it found were fixed after the stack first came up, so the release
+   commit should be exercised as a whole rather than inheriting this result.
+3. Apply the GitHub repository settings listed above, then confirm every workflow succeeds on the
+   public host. The container workflow builds and validates the image but does not bring up the
+   Compose stack, so the integration test stays a release-time manual step.
+4. Have an independent reviewer confirm private-file exclusion and this evidence, per
    `docs/release-checklist.md`.
 
 No risk was accepted silently, no scanner finding was suppressed, and no test was weakened.

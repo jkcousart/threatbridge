@@ -6,11 +6,18 @@ separate release decisions.
 
 Prebuilt container publication is not yet approved. The blocking HIGH and CRITICAL findings recorded
 in `release-validation.md` came from the previous Debian base; the default is now the Alpine 3.24
-candidate that recorded zero HIGH or CRITICAL findings under the reviewed Trivy 0.70.0 policy. Two
-requirements remain before a prebuilt image can be called ready: the image must be rebuilt from the
-committed Dockerfile default and revalidated, SBOM-generated, and rescanned as that exact artifact,
-and the production Compose stack must be exercised end to end against it. Until both are done, the
-Alpine result is evidence about a locally built candidate rather than about a publishable artifact.
+candidate that recorded zero HIGH or CRITICAL findings under the reviewed Trivy 0.70.0 policy.
+
+That default has since been rebuilt with no `--build-arg` override, revalidated, SBOM-generated, and
+rescanned as that exact artifact, and the production Compose stack has been exercised end to end
+against it — `deploy-check`, migrations, PostgreSQL, and readiness all confirmed, with runtime
+confinement read off live containers. That run also uncovered six deployment defects that static
+review had not, all since fixed; `security/public-release-hardening-audit.md` records them in full.
+
+Publication of a prebuilt image nonetheless remains blocked, because publishing an image is a durable
+claim about vulnerability status while a clean scan is a single point-in-time observation. The base
+digests must be re-resolved and rescanned immediately before release, and the rebuild plus
+integration test must be repeated against the actual release commit.
 
 ## Release preparation present
 

@@ -27,8 +27,11 @@ def test_production_compose_separates_database_and_edge_networks() -> None:
     assert services["db"]["networks"] == ["database"]
     assert compose["networks"]["database"]["internal"] is True
     assert services["web"]["networks"] == ["database", "edge"]
-    # deploy-check never needs network access; it only reads configuration.
+    # deploy-check never needs network access; it only reads configuration. Leaving the
+    # networks key off is not enough, because Compose then attaches it to the implicit
+    # default bridge and the gate gains outbound access.
     assert "networks" not in services["deploy-check"]
+    assert services["deploy-check"]["network_mode"] == "none"
 
 
 def test_production_compose_runs_django_deployment_checks_before_serving() -> None:
@@ -60,6 +63,10 @@ def test_production_compose_applies_runtime_confinement_to_every_app_service() -
         assert "privileged" not in service, name
         limits = service["deploy"]["resources"]["limits"]
         assert limits["cpus"] and limits["memory"], name
+        # Compose rejects a project that sets pids_limit next to deploy.resources.limits
+        # without a matching pids entry, and older releases ignore deploy outside swarm.
+        # Both keys are therefore required, and they must agree.
+        assert limits["pids"] == service["pids_limit"], name
         tmpfs = service["tmpfs"]
         assert len(tmpfs) == 1, name
         assert tmpfs[0].startswith("/tmp:"), name
@@ -79,7 +86,9 @@ def test_production_compose_grants_the_database_only_the_capabilities_it_needs()
         "SETUID",
     }
     assert database["pids_limit"] > 0
-    assert database["deploy"]["resources"]["limits"]["memory"]
+    limits = database["deploy"]["resources"]["limits"]
+    assert limits["memory"]
+    assert limits["pids"] == database["pids_limit"]
 
 
 def test_production_compose_shares_no_host_namespace_or_privileged_path() -> None:
@@ -342,13 +351,36 @@ def test_production_compose_runs_migrations_without_a_shell() -> None:
     web = compose["services"]["web"]
     assert migrate["command"] == ["python", "manage.py", "migrate", "--noinput"]
     assert web["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
-    assert web["healthcheck"]["test"][0] == "CMD"
+    # The probe command belongs to the image. Redefining `test` here would override the
+    # Dockerfile's HEALTHCHECK, which is how the two previously drifted apart.
+    health_check = web["healthcheck"]
+    assert "test" not in health_check
+    assert health_check["interval"] and health_check["retries"]
     assert migrate["read_only"] is True
     assert web["read_only"] is True
     assert migrate["cap_drop"] == ["ALL"]
     assert web["cap_drop"] == ["ALL"]
     assert migrate["user"] == "65532:65532"
     assert web["user"] == "65532:65532"
+
+
+def test_image_health_check_presents_an_allowed_host() -> None:
+    """A loopback probe still has to satisfy ALLOWED_HOSTS.
+
+    Requesting http://127.0.0.1:8000/ sends `Host: 127.0.0.1`, which production settings
+    reject with 400, so the container would never report healthy. The probe therefore has
+    to send a configured host rather than ALLOWED_HOSTS being widened to accept loopback.
+    """
+
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    health_check = next(
+        line for line in dockerfile.splitlines() if line.strip().startswith('CMD ["python"')
+    )
+    assert "DJANGO_ALLOWED_HOSTS" in health_check
+    assert "'Host': host" in health_check
+    # Loopback only: the probe must never resolve or dial the public hostname.
+    assert "http://127.0.0.1:8000/readyz" in health_check
+    assert "timeout=3" in health_check
 
 
 def test_step_ca_overlay_adds_trust_without_disabling_verification() -> None:
@@ -387,7 +419,110 @@ def test_step_ca_overlay_adds_trust_without_disabling_verification() -> None:
     ):
         assert forbidden not in source.lower(), forbidden
     assert set(overlay["services"]) == set(APP_SERVICES)
-    assert set(overlay) == {"x-extra-ca-config", "services", "configs"}
+    assert set(overlay) == {
+        "x-extra-ca-config",
+        "services",
+        "configs",
+    }
+
+
+def compose_available() -> bool:
+    try:
+        completed = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def write_disposable_production_env(directory: Path) -> Path:
+    """Produce a syntactically complete environment file with throwaway values.
+
+    Nothing here reaches a network or a real secret. The point is only to satisfy the
+    profile's required variables so Compose can resolve and validate the project.
+    """
+
+    env_file = directory / ".env.production"
+    env_file.write_text(
+        "\n".join(
+            (
+                "DJANGO_ALLOWED_HOSTS=threatbridge.example.invalid",
+                "DJANGO_CSRF_TRUSTED_ORIGINS=https://threatbridge.example.invalid",
+                "DJANGO_SECURE_HSTS_SECONDS=0",
+                "THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=opencti.example.invalid",
+                "THREATBRIDGE_BIND_ADDRESS=127.0.0.1",
+                "THREATBRIDGE_PORT=18020",
+                "THREATBRIDGE_SECRETS_DIR=" + str(directory / "secrets"),
+                "THREATBRIDGE_PYTHON_BUILDER_IMAGE=python@sha256:" + "0" * 64,
+                "THREATBRIDGE_PYTHON_RUNTIME_IMAGE=python@sha256:" + "0" * 64,
+                "THREATBRIDGE_POSTGRES_IMAGE=postgres@sha256:" + "0" * 64,
+                "THREATBRIDGE_IMAGE=threatbridge:local",
+                "THREATBRIDGE_USE_EXTRA_CA=false",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    secrets = directory / "secrets"
+    secrets.mkdir(exist_ok=True)
+    secrets.chmod(0o700)
+    for name in ("django-secret-key", "database-url", "postgres-password"):
+        secret = secrets / name
+        secret.write_text("disposable-test-value\n", encoding="utf-8")
+        secret.chmod(0o600)
+    return env_file
+
+
+@pytest.mark.skipif(not compose_available(), reason="docker compose is unavailable")
+def test_production_compose_is_a_valid_compose_project(tmp_path: Path) -> None:
+    """Compose has semantics that parsing the YAML cannot check.
+
+    Setting `pids_limit` beside `deploy.resources.limits` without a matching `pids` entry
+    is well-formed YAML and an invalid project, so only Compose itself can prove the
+    profile is loadable.
+    """
+
+    env_file = write_disposable_production_env(tmp_path)
+    for overlay in ([], ["-f", str(ROOT / "compose.production.step-ca.yml")]):
+        environment = {
+            **os.environ,
+            "THREATBRIDGE_EXTRA_CA_PATH": str(tmp_path / "ca.crt"),
+        }
+        (tmp_path / "ca.crt").write_text("", encoding="utf-8")
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                str(env_file),
+                "-f",
+                str(ROOT / "compose.production.yml"),
+                *overlay,
+                "config",
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        rendered = yaml.safe_load(result.stdout)
+        for name in ("db", *APP_SERVICES):
+            service = rendered["services"][name]
+            limits = service["deploy"]["resources"]["limits"]
+            assert limits["pids"] == service["pids_limit"], name
+        # The published port must stay bound to the configured host address.
+        published = rendered["services"]["web"]["ports"]
+        assert len(published) == 1
+        assert published[0]["host_ip"] == "127.0.0.1"
+        assert published[0]["target"] == 8000
 
 
 def test_production_compose_uses_file_backed_secrets() -> None:
@@ -446,7 +581,11 @@ def test_prepare_production_deployment_creates_restricted_files(tmp_path: Path) 
     for name in ("django-secret-key", "database-url", "postgres-password"):
         path = secrets_dir / name
         assert path.is_file()
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        # Compose outside swarm bind-mounts the host file as-is and ignores uid/gid/mode,
+        # so a 0600 file owned by the operator is unreadable to the container's 65532 user
+        # and the application cannot load its own secret. The 0700 directory above is what
+        # keeps the value confidential on the host.
+        assert stat.S_IMODE(path.stat().st_mode) == 0o444
         assert path.read_text(encoding="utf-8").strip()
     environment = env_file.read_text(encoding="utf-8")
     assert "DJANGO_ALLOWED_HOSTS=threatbridge.example.invalid" in environment
@@ -454,6 +593,51 @@ def test_prepare_production_deployment_creates_restricted_files(tmp_path: Path) 
     assert "THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=opencti.example.invalid" in environment
     assert "THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS=192.0.2.0/24" in environment
     assert "THREATBRIDGE_USE_EXTRA_CA=false" in environment
+
+
+def test_prepare_production_deployment_repairs_unreadable_existing_secrets(
+    tmp_path: Path,
+) -> None:
+    """An upgrade must fix secrets written under the previous owner-only mode.
+
+    Otherwise a deployment created before this policy keeps failing at startup with an
+    unreadable secret file and no obvious cause.
+    """
+
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(mode=0o700)
+    password = "existing-postgres-password"
+    contents = {
+        "django-secret-key": "existing-django-secret-key",
+        "postgres-password": password,
+        "database-url": f"postgresql://threatbridge:{password}@db:5432/threatbridge",
+    }
+    preserved = {}
+    for name, value in contents.items():
+        path = secrets_dir / name
+        path.write_text(f"{value}\n", encoding="utf-8")
+        path.chmod(0o600)
+        preserved[name] = path.read_text(encoding="utf-8")
+    result = run_prepare(tmp_path)
+    assert result.returncode == 0, result.stderr
+    for name, original in preserved.items():
+        path = secrets_dir / name
+        assert stat.S_IMODE(path.stat().st_mode) == 0o444
+        # Re-moding must not rotate a secret that is already in use.
+        assert path.read_text(encoding="utf-8") == original
+
+
+def test_prepare_production_deployment_refuses_group_or_world_writable_secrets(
+    tmp_path: Path,
+) -> None:
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(mode=0o700)
+    secret = secrets_dir / "django-secret-key"
+    secret.write_text("existing-value\n", encoding="utf-8")
+    secret.chmod(0o666)
+    result = run_prepare(tmp_path)
+    assert result.returncode != 0
+    assert "writable existing secret permissions" in result.stderr
 
 
 def test_prepare_production_deployment_enables_reviewed_extra_ca(tmp_path: Path) -> None:
@@ -464,6 +648,30 @@ def test_prepare_production_deployment_enables_reviewed_extra_ca(tmp_path: Path)
     environment = (tmp_path / "deployment.env").read_text(encoding="utf-8")
     assert "THREATBRIDGE_USE_EXTRA_CA=true" in environment
     assert f"THREATBRIDGE_EXTRA_CA_PATH={ca_file.resolve()}" in environment
+
+
+@pytest.mark.parametrize(
+    "mode, message",
+    [
+        (0o600, "would not be readable by the container user 65532"),
+        (0o646, "must not be group- or world-writable"),
+    ],
+)
+def test_prepare_production_deployment_checks_extra_ca_readability(
+    tmp_path: Path, mode: int, message: str
+) -> None:
+    """The overlay's uid/gid/mode options are ignored outside swarm.
+
+    An operator-only CA file therefore mounts unreadable, and the private-CA integration
+    fails at connection time rather than at configuration time.
+    """
+
+    ca_file = tmp_path / "root-ca.crt"
+    ca_file.write_text("reviewed test CA\n", encoding="utf-8")
+    ca_file.chmod(mode)
+    result = run_prepare(tmp_path, "--extra-ca-path", str(ca_file))
+    assert result.returncode != 0
+    assert message in result.stderr
 
 
 def test_prepare_production_deployment_refuses_overwrite(tmp_path: Path) -> None:

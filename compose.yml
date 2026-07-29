@@ -60,7 +60,7 @@ services:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz')"]
+      # Inherits the image's HEALTHCHECK command; only the timings are tuned here.
       interval: 15s
       timeout: 5s
       retries: 5

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import logging
 import os
+import re
 import stat
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -264,6 +267,36 @@ class ProductionSettingsTests(SimpleTestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("must not be group- or world-writable", result.stderr)
 
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses file permission checks")
+    def test_unreadable_configured_file_fails_closed(self):
+        """A mounted file keeps the host owner's mode, so it can be present yet unreadable.
+
+        Metadata checks pass on such a file. Without an explicit read the process starts
+        with no private CA trust and the only later symptom is a failed connection, so the
+        misconfiguration has to be refused at startup.
+        """
+
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            ca_file = directory / "internal-root-ca.crt"
+            ca_file.write_text("synthetic-ca", encoding="utf-8")
+            ca_file.chmod(0o000)
+            environment = self._production_environment()
+            environment["THREATBRIDGE_EXTRA_CA_FILE"] = str(ca_file)
+            result = self._import_settings(environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Unable to read THREATBRIDGE_EXTRA_CA_FILE", result.stderr)
+
+            secret_file = directory / "django-secret-key"
+            secret_file.write_text(STRONG_TEST_SECRET_KEY, encoding="utf-8")
+            secret_file.chmod(0o000)
+            environment = self._production_environment()
+            environment.pop("DJANGO_SECRET_KEY")
+            environment["DJANGO_SECRET_KEY_FILE"] = str(secret_file)
+            result = self._import_settings(environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Unable to read DJANGO_SECRET_KEY_FILE", result.stderr)
+
     def test_wildcard_hosts_and_sqlite_are_rejected(self):
         environment = self._production_environment()
         environment["DJANGO_ALLOWED_HOSTS"] = "*"
@@ -406,6 +439,30 @@ class ProductionSettingsTests(SimpleTestCase):
             logger = threatbridge_settings.LOGGING["loggers"][logger_name]
             self.assertEqual(logger["handlers"], ["console"])
             self.assertFalse(logger["propagate"])
+
+    def test_only_health_endpoints_are_exempt_from_the_https_redirect(self):
+        """The container health check probes loopback over plain HTTP.
+
+        Without an exemption the production HTTPS redirect answers 301 to the public
+        hostname, which the probe cannot follow, so the container never reports healthy.
+        The exemption has to stay narrow: health endpoints only.
+        """
+
+        result = self._import_settings(
+            self._production_environment(),
+            "(settings.SECURE_SSL_REDIRECT, settings.SECURE_REDIRECT_EXEMPT)",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        redirect_enabled, exempt = ast.literal_eval(result.stdout.strip())
+        self.assertTrue(redirect_enabled)
+        self.assertEqual(sorted(exempt), [r"^healthz$", r"^readyz$"])
+        # Anchored patterns only, so nothing outside the two health paths is exempt.
+        for pattern in exempt:
+            self.assertTrue(pattern.startswith("^") and pattern.endswith("$"), pattern)
+            expression = re.compile(pattern)
+            for protected in ("admin/", "api/", "api/imports", "", "healthz/secret"):
+                self.assertIsNone(expression.match(protected), (pattern, protected))
+        self.assertTrue(re.compile(exempt[0]).match("healthz"))
 
     def test_readiness_failure_is_generic(self):
         request = RequestFactory().get("/readyz")

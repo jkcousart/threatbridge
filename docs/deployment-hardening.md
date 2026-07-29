@@ -108,10 +108,17 @@ publishes only on `127.0.0.1:8000`. The production profile:
 - runs `manage.py check --deploy --fail-level ERROR` in a `deploy-check` service, then migrations in
   a one-shot `migrate` service, before starting Gunicorn;
 - gives PostgreSQL no published port and places it on an internal network;
+- runs the `deploy-check` gate with `network_mode: none`, because it reads configuration only.
+  Omitting the `networks` key is not sufficient: Compose would attach the service to the implicit
+  default bridge and give the gate outbound access it never uses;
 - drops all Linux capabilities from application services, enables `no-new-privileges`, and uses a
   read-only root filesystem whose only writable paths are a bounded `noexec,nosuid,nodev` `/tmp`
   tmpfs and the named `threatbridge-data` volume at `/app/data`;
-- sets `init: true`, a `pids_limit`, and CPU/memory limits on every service;
+- sets `init: true` and CPU/memory limits on every service, and declares each PID ceiling as both
+  `pids_limit` and `deploy.resources.limits.pids` from a single YAML anchor. Both keys are required:
+  Compose rejects the project outright when `pids_limit` sits beside `deploy.resources.limits`
+  without a matching `pids` entry, and Compose releases that ignore `deploy` outside Swarm would
+  otherwise drop the limit silently;
 - caps container log size and rotation with the `json-file` driver;
 - shares no host namespace, mounts no Docker socket, no host root, and no `/proc`, `/sys`, or
   `/dev` path, and adds no device, sysctl, or `extra_hosts` entry; and
@@ -129,17 +136,51 @@ deliberately updates only the three image references. It does not deploy, publis
 findings, or accept risk.
 
 The application accepts `DJANGO_SECRET_KEY_FILE` and `DATABASE_URL_FILE` only as absolute, regular,
-non-symlink files that are not group- or world-writable. Direct and file-backed forms are mutually
-exclusive. Connector tokens continue to use each integration's existing `secret_reference`
-contract. See [`../deploy/README.md`](../deploy/README.md) for the full list of supported secret
-injection methods.
+non-symlink files that are not group- or world-writable, and it reads each one at startup so an
+unreadable file fails closed instead of surfacing later as an unexplained failure. Direct and
+file-backed forms are mutually exclusive. Connector tokens continue to use each integration's
+existing `secret_reference` contract. See [`../deploy/README.md`](../deploy/README.md) for the full
+list of supported secret injection methods.
+
+### Secret file modes and the Compose bind-mount
+
+Outside Swarm, Compose bind-mounts a file-backed secret with the host file's ownership and mode and
+ignores the `uid`, `gid`, and `mode` options, warning `config uid, gid and mode are not supported,
+they will be ignored`. The container runs as UID 65532 and cannot be granted ownership of an
+operator-owned file without root, so an owner-only secret mounts unreadable and startup aborts.
+
+`scripts/prepare_production_deployment.py` therefore writes secrets mode `0444` inside a `0700`
+directory. The directory is the boundary that matters: no unprivileged host user can traverse into
+it, so the permissive file mode is unreachable, and a read-only file also prevents the container from
+rewriting its own credentials. Keep the secrets directory `0700`; the script verifies this on every
+run. If you inject secrets by another mechanism, the same requirement applies — the file must be
+readable by UID 65532 and its directory must not be world-traversable.
+
+### Health checks and the HTTPS redirect
+
+`SECURE_SSL_REDIRECT` is enabled in production, with `SECURE_REDIRECT_EXEMPT` limited to `^healthz$`
+and `^readyz$`. The container health check probes `http://127.0.0.1:8000/readyz` over loopback and
+cannot follow a redirect to the public hostname, so without those two exemptions the container
+answers `301` to its own probe and never reports healthy. Both endpoints return a fixed status
+string and no configuration detail, and every path that carries data still redirects.
+
+The probe sends the first entry of `DJANGO_ALLOWED_HOSTS` as its `Host` header. `ALLOWED_HOSTS`
+remains authoritative and is never widened to accept loopback, so an unrecognised `Host` is still
+answered with `400`. Both Compose profiles omit `test` from their `healthcheck` blocks and override
+only the timings, which keeps the probe defined once in the `Dockerfile`.
 
 An optional `compose.production.step-ca.yml` overlay mounts one reviewed internal CA certificate
-read-only at `/run/configs/threatbridge_extra_ca` (owner `65532:65532`, mode `0444`) for the
-`deploy-check`, `migrate`, and `web` services and sets `THREATBRIDGE_EXTRA_CA_FILE`. The outbound
-client starts from Python's default TLS context and adds that certificate with
-`load_verify_locations`; it does not disable hostname verification, replace public trust, or grant
-access to a host certificate directory.
+read-only at `/run/configs/threatbridge_extra_ca` for the `deploy-check`, `migrate`, and `web`
+services and sets `THREATBRIDGE_EXTRA_CA_FILE`. The outbound client starts from Python's default TLS
+context and adds that certificate with `load_verify_locations`; it does not disable hostname
+verification, replace public trust, or grant access to a host certificate directory.
+
+The certificate must be mode `0444` on the host for the same reason as the secret files: Compose
+ignores the overlay's `uid`, `gid`, and `mode` options and mounts the host file as-is. A CA
+certificate is public material, so a readable mode costs nothing.
+`scripts/prepare_production_deployment.py` refuses an unreadable certificate, and the `deploy-check`
+gate fails closed if one reaches the container, rather than starting with the private CA silently
+missing from the trust store.
 
 ### PostgreSQL container residual risk
 

@@ -37,8 +37,21 @@ python scripts/prepare_production_deployment.py \
   --private-cidr 192.0.2.0/24
 ```
 
-The command creates `deploy/.env.production` and three mode-`0600` secret files beneath
-`deploy/secrets/`. Existing secrets are preserved unless `--force` is explicitly supplied.
+The command creates a mode-`0600` `deploy/.env.production` and three mode-`0444` secret files
+inside a mode-`0700` `deploy/secrets/` directory. Existing secrets are preserved unless `--force`
+is explicitly supplied; re-running the command re-applies the mode so a deployment prepared before
+this policy is repaired in place without rotating the values.
+
+The secret files are read-only to everyone rather than owner-only for a specific reason. Outside
+Swarm, Compose bind-mounts a file-backed secret with the host file's ownership and mode and ignores
+the `uid`, `gid`, and `mode` options, printing `config uid, gid and mode are not supported, they
+will be ignored`. The container runs as UID 65532, which cannot be granted ownership without root,
+so an owner-only file mounts unreadable and the application aborts at startup with
+`Unable to read DJANGO_SECRET_KEY_FILE`. Confidentiality therefore rests on the `0700` secrets
+directory: no unprivileged host user can traverse into it, so the permissive file mode is never
+reachable. Keep that directory `0700` and owned by the deploying account, and do not relocate the
+secrets into a world-traversable path. The preparation script verifies the directory mode on every
+run and refuses any secret file that is group- or world-writable.
 
 Use `--bind-address 127.0.0.1` when the reverse proxy runs on the same host. Use a specific host
 interface address only when the proxy is remote, and firewall that port.
@@ -99,13 +112,22 @@ python scripts/prepare_production_deployment.py \
   --extra-ca-path /absolute/path/to/internal-root-ca.crt
 ```
 
+The certificate file must be readable by UID 65532 — mode `0444` — and must not be group- or
+world-writable. The preparation script refuses an owner-only certificate and tells you the `chmod`
+to run. This is the same Compose limitation described under the secret files: the overlay declares
+`uid`, `gid`, and `mode` on the mount, and Compose ignores all three outside Swarm, mounting the
+host file as-is. A CA certificate is public material, so a readable mode costs nothing. If the file
+is unreadable the `deploy-check` gate now fails closed with
+`Unable to read THREATBRIDGE_EXTRA_CA_FILE` rather than starting with the private CA silently
+absent from the trust store.
+
 This sets `THREATBRIDGE_USE_EXTRA_CA=true`. The `scripts/production_compose.sh` wrapper then applies
 `compose.production.step-ca.yml` automatically to every operation. The overlay mounts that one
-certificate read-only at `/run/configs/threatbridge_extra_ca` (owner `65532:65532`, mode `0444`)
-for the `deploy-check`, `migrate`, and `web` services, and sets `THREATBRIDGE_EXTRA_CA_FILE`. It
-extends Python's default public trust store with `load_verify_locations`; it does not disable TLS
-or hostname verification, does not replace the public CA bundle, and does not mount a host
-certificate directory. Do not source `deploy/.env.production` in a shell.
+certificate read-only at `/run/configs/threatbridge_extra_ca` for the `deploy-check`, `migrate`, and
+`web` services, and sets `THREATBRIDGE_EXTRA_CA_FILE`. It extends Python's default public trust store
+with `load_verify_locations`; it does not disable TLS or hostname verification, does not replace the
+public CA bundle, and does not mount a host certificate directory. Do not source
+`deploy/.env.production` in a shell.
 
 ## 2. Validate and compare the image
 
@@ -196,6 +218,16 @@ Probe:
 
 Neither endpoint requires authentication and neither returns configuration, version, or secret
 detail; readiness failures are generic.
+
+These two paths are the only ones exempt from the production HTTPS redirect, via
+`SECURE_REDIRECT_EXEMPT`. The container's own health check probes `http://127.0.0.1:8000/readyz` on
+loopback and cannot follow a redirect to the public hostname, so without the exemption the container
+would answer `301` to its own probe and never report healthy. Every path that carries data still
+redirects. The probe also sends the first entry of `DJANGO_ALLOWED_HOSTS` as its `Host` header,
+because `ALLOWED_HOSTS` is authoritative and a literal `Host: 127.0.0.1` would be rejected with
+`400`; loopback is never added to `ALLOWED_HOSTS` to accommodate the probe. Both Compose profiles
+deliberately omit `test` from their `healthcheck` blocks and tune only the timings, so the probe is
+defined once in the `Dockerfile` and cannot be overridden into a stale copy.
 
 Start HSTS at the generated short duration. Increase it only after the HTTPS route, certificate
 renewal, proxy headers, backups, and restore procedure have been verified. Startup refuses

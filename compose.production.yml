@@ -1,5 +1,10 @@
 name: threatbridge
 
+# Anchored so each PID ceiling is written once and cannot drift between the two keys that
+# have to agree.
+x-app-pids-limit: &app-pids-limit 256
+x-db-pids-limit: &db-pids-limit 512
+
 x-app-environment: &app-environment
   DJANGO_DEBUG: "false"
   DJANGO_SECRET_KEY_FILE: /run/secrets/django_secret_key
@@ -53,7 +58,11 @@ x-app-security: &app-security
     # The only writable path outside the named data volume. Gunicorn needs it for worker
     # heartbeat files; nothing there is ever executed.
     - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
-  pids_limit: 256
+  # Declared in both places with one anchored value. Compose rejects a project that sets
+  # pids_limit alongside deploy.resources.limits without a matching pids entry, and older
+  # Compose releases ignore deploy outside swarm, so keeping both is what guarantees the
+  # limit is actually applied.
+  pids_limit: *app-pids-limit
   # PID 1 reaping for any short-lived child processes under a read-only root.
   init: true
   deploy:
@@ -61,6 +70,7 @@ x-app-security: &app-security
       limits:
         cpus: ${THREATBRIDGE_APP_CPU_LIMIT:-2.0}
         memory: ${THREATBRIDGE_APP_MEMORY_LIMIT:-1g}
+        pids: *app-pids-limit
       reservations:
         memory: ${THREATBRIDGE_APP_MEMORY_RESERVATION:-256m}
 
@@ -110,13 +120,14 @@ services:
       - FOWNER
       - SETGID
       - SETUID
-    pids_limit: 512
+    pids_limit: *db-pids-limit
     init: true
     deploy:
       resources:
         limits:
           cpus: ${THREATBRIDGE_DB_CPU_LIMIT:-2.0}
           memory: ${THREATBRIDGE_DB_MEMORY_LIMIT:-1g}
+          pids: *db-pids-limit
         reservations:
           memory: ${THREATBRIDGE_DB_MEMORY_RESERVATION:-256m}
     logging: *default-logging
@@ -129,6 +140,9 @@ services:
     command: ["python", "manage.py", "check", "--deploy", "--fail-level", "ERROR"]
     environment: *app-environment
     secrets: *app-secrets
+    # Reads configuration only. Declaring no networks would attach it to the implicit
+    # default bridge and give the gate outbound access it never uses.
+    network_mode: none
     restart: "no"
     <<: *app-security
     logging: *default-logging
@@ -183,7 +197,9 @@ services:
     ports:
       - "${THREATBRIDGE_BIND_ADDRESS:?Set the dedicated host LAN address}:${THREATBRIDGE_PORT:-8020}:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3).read()"]
+      # No `test` on purpose. Compose inherits the image's HEALTHCHECK command and applies
+      # only the timings below, so the probe is defined once in the Dockerfile and a fix
+      # there cannot be silently overridden here.
       interval: 15s
       timeout: 5s
       retries: 5

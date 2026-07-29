@@ -62,7 +62,20 @@ This checklist prepares a release candidate; completing it does not itself autho
       image SBOM, and an unsuppressed scan of the new image ID. A previous base's evidence is never
       carried forward.
 - [ ] The production Compose stack is started end to end against the rebuilt image, with migrations
-      and readiness confirmed, before any prebuilt image is considered publishable.
+      and readiness confirmed, before any prebuilt image is considered publishable. Run this on the
+      actual release commit; a passing run on an earlier commit is not evidence about the release.
+- [ ] `docker compose config` exits zero for the production profile and for the step-ca overlay.
+      Compose enforces semantics that parsing the YAML cannot, so a profile that only passes the unit
+      tests may still be an invalid project.
+- [ ] `deploy-check` and `migrate` both exit zero and `web` reaches `healthy`. A container stuck at
+      `starting` or reaching `unhealthy` is a release blocker, not a timing artefact.
+- [ ] Generated secret files are readable by UID 65532 and their directory is mode `0700`. If a
+      private CA is configured, the certificate is mode `0444`. Compose ignores `uid`, `gid`, and
+      `mode` outside Swarm, so an owner-only file mounts unreadable.
+- [ ] With a private CA configured, confirm the certificate is actually present in the running
+      container's trust store rather than assuming the mount succeeded.
+- [ ] `/readyz` and `/healthz` return `200` over plain HTTP with a configured `Host`, a data-carrying
+      path such as `/admin/` still returns `301`, and an unrecognised `Host` still returns `400`.
 - [ ] CodeQL and dependency review have run successfully on the intended public host where
       supported.
 
