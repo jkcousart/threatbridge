@@ -375,6 +375,77 @@ This run used a disposable environment file, throwaway secrets, a `.invalid` out
 self-signed test CA. No live credential or production connector was involved, and no connector
 synchronisation was exercised against a real endpoint. Restore-from-backup was not exercised.
 
+### Follow-up: codifying the integration test as a gate (2026-07-29)
+
+The run above was performed by hand. That is a poor place to leave a control that just found six
+defects, three of which prevented the documented deployment from starting: a manual procedure is
+only as reliable as the next person's willingness to repeat all of it, and the most valuable checks
+were the ones nobody had thought to perform before. The test is therefore now a script.
+
+`scripts/validate_production_compose.sh` is the authoritative gate and reuses the exact commands
+proven above. It requires Docker with Compose v2 and buildx, `openssl`, the project virtual
+environment, and Trivy 0.70.0, and fails with a prerequisite message rather than skipping a phase.
+In order it:
+
+1. creates a mode `0700` directory under `/tmp` and a unique Compose project name, arming the
+   cleanup trap before anything else exists;
+2. selects a free loopback port and generates disposable settings and secrets through
+   `prepare_production_deployment.py` using `threatbridge.localhost` and `opencti.example.invalid`;
+3. asserts the generated secrets are mode `0444` inside a `0700` directory, and refuses to proceed if
+   it were pointed at the repository's own `.env`, `.secrets`, `deploy/` state, or `db.sqlite3`;
+4. resolves immutable builder, runtime, and PostgreSQL digests, then **fails unless the resolved
+   builder and runtime digests equal the committed `ARG` defaults in the `Dockerfile`**, so the
+   artifact under test cannot be a substituted base;
+5. builds with no base `--build-arg`, then runs `validate_container_image.sh`,
+   `generate_image_sbom.sh`, and `scan_container_image.sh` unsuppressed;
+6. renders the Compose project, asserts the rendered policy, brings the stack up, and waits with a
+   bounded timeout for `deploy-check` and `migrate` to exit `0` and `web` to become healthy;
+7. asserts the live contract in the table above, reading it off running containers rather than off
+   the YAML;
+8. tears down with `docker compose down --volumes --remove-orphans` and removes the temporary
+   directory unless `THREATBRIDGE_KEEP_INTEGRATION_ARTIFACTS=1`.
+
+A second phase covers the private CA that M-13 showed was failing silently. It generates a
+disposable CA with `openssl`, discards the private key immediately and asserts the certificate file
+contains none, sets mode `0444`, renders the overlay, and then proves the readable case by loading
+the application's own TLS context inside the running container and requiring `CERT_REQUIRED`,
+`check_hostname`, and the presence of the test CA's subject. The "extends rather than replaces"
+property is proven numerically: the trust-anchor count is captured without the overlay in phase one
+and must be exactly one higher with it. Observed: **119 anchors without the overlay, 120 with it.**
+The unreadable case then `chmod 0600`s the certificate and requires `docker compose up` to fail,
+`deploy-check` to exit non-zero with `Unable to read THREATBRIDGE_EXTRA_CA_FILE`, and `web` never to
+reach `running`. TLS verification is never disabled to make any of this pass.
+
+`.github/workflows/compose-integration.yml` runs the same script on every pull request and every
+push to `main`, on `ubuntu-24.04`, with `contents: read`, a 45-minute timeout, concurrency
+cancellation, and every action pinned to a full commit SHA. It uses `pull_request`, not
+`pull_request_target`, and consumes no secret, so a forked pull request runs with a read-only token
+and no repository credential. It builds and exercises the stack and never logs in to a registry or
+pushes an image; prebuilt-image publication remains a separate explicit release action. On failure
+it uploads container names, states, and Docker versions for seven days. Container logs are
+deliberately excluded from that artifact: the script already prints them through the application's
+own `threatbridge.log_redaction.redact` filter, and re-collecting them would risk publishing an
+unredacted copy.
+
+#### The gate found a seventh defect on its first complete run
+
+Recorded below as **M-15**. Phase two calls `prepare_production_deployment.py --force` to enable the
+overlay on an already-prepared deployment, and it failed with
+`PermissionError: [Errno 13] Permission denied`. The `0444` secret mode introduced earlier in this
+follow-up to fix H-8 had broken secret rotation: `ensure_secret` opened the existing path
+`O_WRONLY|O_TRUNC`, which cannot succeed against a file with no write bit, even for its owner.
+Every documented rotation on any existing deployment would have failed this way.
+
+This is the point of the gate. A fix for one defect introduced another, the test suite did not
+cover the `--force` path against real on-disk modes, and it took an end-to-end run to surface it.
+
+Two further defects in the gate itself were found and fixed the same way, which is worth recording
+because both would have degraded the control quietly. Appending `THREATBRIDGE_IMAGE` to the
+generated environment file produced a duplicate key, which Compose rejects with exit `1` — the run
+aborted with no explanation at all, because a bare `set -e` exit prints nothing. The script now
+replaces the key rather than appending, and an `ERR` trap reports the failing command and line, so a
+gate failure can never again be silent.
+
 ## Findings by severity
 
 No finding was a live secret, a credential in history, or an exploitable remote vulnerability. The
@@ -412,6 +483,7 @@ baseline was already substantially hardened; these are the gaps found and closed
 | M-12 | Authorization tests covered successful paths and a subset of denials. Several state-changing endpoints had no test proving they refuse an authenticated caller without the required permission. | Three parameterised denial tests now cover every state-changing endpoint on both the browser and API surfaces, restricted-evidence reads, and anonymous mutations. |
 | M-13 | Found by live execution. The private-CA overlay mounted the certificate with the host's owner-only mode, so the application could not read it, and `_configured_file_path` validated metadata without reading the file. The stack reported healthy while the private CA was silently absent from the trust store, so an operator would have believed private-CA verification was active. | Every configured file is now read at startup, so an unreadable trust anchor or secret fails closed at the `deploy-check` gate. `prepare_production_deployment.py` refuses a certificate UID 65532 could not read and names the required `chmod`. |
 | M-14 | Found by live execution. Both Compose profiles redefined `healthcheck.test`, overriding the image's `HEALTHCHECK`, so the two copies had drifted and a fix in the `Dockerfile` had no effect. | Both profiles omit `test` and tune only the timings, so the probe is defined once in the image. A test asserts `test` stays absent. |
+| M-15 | Found by the new integration gate, and introduced by the fix for H-8. Storing secrets at mode `0444` made them unopenable for writing, so `prepare_production_deployment.py --force` failed with `EACCES` on any already-prepared deployment. Documented secret rotation was broken for every existing operator, and no test covered the `--force` path against real on-disk modes. | `ensure_secret` unlinks the existing file and creates the replacement with `O_EXCL`, which also removes any chance of writing through a path that changed after the symlink check. A regression test rotates real `0444` files and asserts the values change, the mode stays `0444`, and the rotated URL still embeds the rotated password. |
 
 ### Low
 
@@ -464,14 +536,16 @@ full-SHA action pins; and no `pull_request_target` and no workflow consuming a s
 
 **Scripts** — `scripts/resolve_production_images.sh`, `scripts/compare_base_images.sh`,
 `scripts/security_check.sh`, `scripts/validate_container_image.sh`,
-`scripts/prepare_production_deployment.py`.
+`scripts/prepare_production_deployment.py`,
+`scripts/validate_production_compose.sh` (new, the authoritative integration gate).
 
 **Supply chain** — `.github/workflows/container-scan.yml` (new),
+`.github/workflows/compose-integration.yml` (new),
 `.github/workflows/dependency-review.yml`, `.gitignore`, `.dockerignore`.
 
 **Tests** — `threatbridge/tests/test_settings.py`, `threatbridge/tests/test_authorization.py`,
 `integrations/tests/test_http.py`, `tests/test_deployment_tooling.py`,
-`tests/test_release_tooling.py`.
+`tests/test_release_tooling.py`, `tests/test_compose_integration_gate.py` (new).
 
 **Documentation** — `README.md`, `SECURITY.md`, `SUPPORT.md`, `CHANGELOG.md`,
 `docs/security-architecture.md`, `docs/deployment-hardening.md`,
@@ -513,6 +587,10 @@ From the Compose integration test:
 - `/healthz` and `/readyz` are no longer redirected to HTTPS in production. Every other path is
   unchanged. A reverse proxy that relied on receiving a `301` from these two paths will now receive
   `200`.
+- `prepare_production_deployment.py --force` now removes and recreates each secret rather than
+  truncating it in place. The rotated values and modes are the same as before; the difference is that
+  rotation succeeds against the `0444` files described above, where it previously failed with
+  `EACCES`.
 
 ## Test and scanner outcomes
 
@@ -521,14 +599,14 @@ pip-audit 2.10.1, Trivy 0.70.0, Gitleaks (build-stamped version string).
 
 | Check | Result |
 | --- | --- |
-| `python -m pytest` | **Pass** — 232 passed, 130 subtests passed (baseline: 180 passed) |
+| `python -m pytest` | **Pass** — 275 passed, 130 subtests passed (baseline: 180 passed) |
 | `python manage.py check` | **Pass** — no issues |
 | `python manage.py makemigrations --check --dry-run` | **Pass** — no changes detected |
 | `manage.py check --deploy --fail-level ERROR` (synthetic production) | **Pass** — exit 0, one informational `security.W021` HSTS-preload notice |
 | `python -m ruff check .` | **Pass** |
 | `python -m ruff format --check .` | **Pass at baseline parity** — 37 pre-existing files differ, unchanged by this work; every file touched here is format-clean |
 | `python scripts/validate_dependency_locks.py` | **Pass** — build 3, runtime 11, development 73 |
-| `python scripts/validate_workflows.py` | **Pass** — 6 workflows, 13 pinned action uses |
+| `python scripts/validate_workflows.py` | **Pass** — 7 workflows, 16 pinned action uses |
 | `python -m pip check` | **Pass** |
 | `pip-audit --require-hashes --disable-pip` on both locks | **Pass** — no known vulnerabilities |
 | `python -m bandit -r catalog integrations threatbridge` | **Pass** — 0 issues across 9,850 lines, 0 `#nosec` |
@@ -546,6 +624,9 @@ pip-audit 2.10.1, Trivy 0.70.0, Gitleaks (build-stamped version string).
 | Rebuild from the committed default | **Pass** — built with no `--build-arg` override; base label confirms the committed Alpine digest; validation, SBOM, and scan all run against that exact image ID, with zero HIGH and zero CRITICAL |
 | Production Compose stack, end to end | **Pass, after six fixes** — `deploy-check` exit 0, migrations applied, PostgreSQL healthy, `web` healthy in about nine seconds, and every confinement property verified against live containers. The six defects found are recorded as H-7, H-8, H-9, M-13, M-14, and L-11. |
 | Development Compose profile | **Pass** — `web` healthy, `/readyz` returns 200, image probe inherited |
+| `bash scripts/validate_production_compose.sh` | **Pass, after one product fix and two gate fixes** — the complete gate ran to a zero exit: committed-default build, image validation, SBOM, unsuppressed scan with zero HIGH and zero CRITICAL, rendered-policy assertions, full stack startup, loopback-only HTTP surface, internal probe, database isolation, live confinement, and both private-CA cases. Its first complete run found M-15. See [Follow-up: codifying the integration test as a gate](#follow-up-codifying-the-integration-test-as-a-gate-2026-07-29). |
+| Private-CA phase, readable certificate | **Pass** — trust anchors went from 119 without the overlay to 120 with it, the test CA subject is present, and the context requires `CERT_REQUIRED` with hostname checking |
+| Private-CA phase, unreadable certificate | **Pass** — `docker compose up` failed, `deploy-check` exited 1 with `Unable to read THREATBRIDGE_EXTRA_CA_FILE`, and `web` never reached `running` |
 
 ### Fail-closed behaviour verified by execution
 
@@ -821,24 +902,51 @@ one of which silently disabled private-CA trust. All are fixed and re-verified, 
 significant gaps in the test strategy are now closed — Compose validates its own project, and
 configured files are read rather than stat'ed.
 
+That run is no longer manual. It is `scripts/validate_production_compose.sh`, a mandatory release
+gate run locally and in CI on every pull request and every push to `main`. Its first complete run
+immediately found a seventh defect (M-15): the `0444` secret mode introduced to fix H-8 had broken
+`--force` secret rotation for every existing deployment. A control that finds a regression in the
+fix for the previous finding, on its first execution, is the strongest available argument for
+running the deployment rather than reading it.
+
 READY is withheld for the reasons below, none of which is a known defect in the reviewed code. **A
 prebuilt image is explicitly not READY**, because publishing an image is a durable claim about
 vulnerability status and the clean scan is a single point-in-time observation.
 
 ### Conditions before publication
 
-1. Re-resolve the base-image digests and rerun the unsuppressed image scan immediately before
-   release, since the clean Alpine result is point-in-time evidence from 2026-07-29. Prebuilt-image
-   publication stays blocked while any HIGH or CRITICAL finding is unfixed; source publication is a
-   separate decision.
-2. Repeat the committed-default rebuild and the Compose integration test on the release commit, using
-   the commands above. The integration test recorded here ran on the working tree that became this
-   commit, and five of the defects it found were fixed after the stack first came up, so the release
-   commit should be exercised as a whole rather than inheriting this result.
-3. Apply the GitHub repository settings listed above, then confirm every workflow succeeds on the
-   public host. The container workflow builds and validates the image but does not bring up the
-   Compose stack, so the integration test stays a release-time manual step.
-4. Have an independent reviewer confirm private-file exclusion and this evidence, per
-   `docs/release-checklist.md`.
+The remaining condition is a sequence, not a list of independent items. Every integration result in
+this document, including the clean scan, describes the commit that produced it and nothing later, so
+the release commit has to be exercised as a whole:
+
+1. **Fast-forward `main` to the final reviewed branch.** No amend, rebase, squash, or force push;
+   the reviewed history is the artifact.
+
+   ```bash
+   git checkout main
+   git merge --ff-only security/public-release-hardening-audit
+   ```
+
+2. **Run the authoritative gate on that exact `main` commit.** This re-resolves the base digests and
+   reruns the unsuppressed scan as part of the run, which is condition 1 of the previous revision of
+   this document. Prebuilt-image publication stays blocked while any HIGH or CRITICAL finding is
+   unfixed; source publication is a separate decision.
+
+   ```bash
+   bash scripts/install_trivy.sh
+   bash scripts/validate_production_compose.sh
+   ```
+
+3. **Push, then require the GitHub checks.** Apply the repository settings listed above, including
+   branch protection requiring `Validate the production Compose stack` alongside
+   `Test, lint, and security`, `Container and filesystem scan`, `CodeQL`, and `Dependency review`,
+   and confirm every workflow succeeds on the public host. CI runs the same script a developer runs;
+   it builds and exercises the stack and publishes nothing.
+
+4. **Only then create a release tag or publish an image.** Have an independent reviewer confirm
+   private-file exclusion and this evidence per `docs/release-checklist.md` first. Publishing a
+   prebuilt image remains a separate explicit action governed by
+   `docs/container-image-security.md`, never a side effect of CI, and requires a fresh unsuppressed
+   scan of the exact image being published.
 
 No risk was accepted silently, no scanner finding was suppressed, and no test was weakened.

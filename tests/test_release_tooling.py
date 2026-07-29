@@ -62,7 +62,11 @@ def test_required_security_workflows_are_present() -> None:
     for required in (
         "ci.yml",
         "codeql.yml",
+        # Builds and validates the image; does not run the stack.
         "container-scan.yml",
+        # Runs the documented production profile end to end. Static inspection let six
+        # deployment defects through, so this is a required gate rather than an extra.
+        "compose-integration.yml",
         "dependency-review.yml",
         "lock-freshness.yml",
         "sbom.yml",

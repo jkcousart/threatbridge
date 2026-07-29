@@ -173,7 +173,39 @@ every candidate's scan passes, so a blocked or skipped scan cannot be read as a 
 acceptable only after application checks, PostgreSQL migrations, readiness, connector TLS behavior,
 runtime permissions, backup/restore, and all exact-image findings are reviewed.
 
+## Live deployment validation
+
+Validating and scanning the image proves the image is sound. It does not prove the deployment
+works, and the distinction is not academic: six defects in the production Compose path reached a
+committed state after the image validation and scan above both passed cleanly.
+
+`scripts/validate_production_compose.sh` closes that gap and is the authoritative gate:
+
+```bash
+bash scripts/validate_production_compose.sh
+```
+
+It builds the committed Dockerfile default with no base substitution — it fails if the resolved
+builder and runtime digests do not match the committed `ARG` defaults, so the artifact under test is
+the one a third party gets from a plain `docker build` — then runs `validate_container_image.sh`,
+`generate_image_sbom.sh`, and `scan_container_image.sh` against it, and finally starts the whole
+production stack on a disposable loopback-only deployment to assert the live runtime contract,
+network isolation, HTTP behaviour, and private-CA handling.
+
+The scan inside the gate is the same unsuppressed scan described above and carries the same
+limitation: a clean result describes one image ID against one vulnerability database at one moment.
+A clean run today is not evidence that the next build is clean. Publication of a prebuilt image
+therefore still requires a fresh unsuppressed scan of the exact image being published, reviewed
+under the finding policy below, and the release commit must itself pass the integration gate before
+any tag or image is published.
+
 ## Continuous scanning
+
+`.github/workflows/compose-integration.yml` runs the integration gate on every pull request and
+every push to `main`, on `ubuntu-24.04`, with `contents: read`, a 45-minute job timeout, and
+concurrency cancellation. It builds and exercises the stack; it never logs in to a registry, pushes
+an image, or consumes a secret. Prebuilt-image publication remains a separate explicit release
+action, not a CI side effect.
 
 `.github/workflows/container-scan.yml` runs on relevant pushes and pull requests and weekly. It
 installs the checksum-verified Trivy build, scans the repository for committed secrets, scans the

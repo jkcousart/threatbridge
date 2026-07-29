@@ -14,10 +14,18 @@ against it — `deploy-check`, migrations, PostgreSQL, and readiness all confirm
 confinement read off live containers. That run also uncovered six deployment defects that static
 review had not, all since fixed; `security/public-release-hardening-audit.md` records them in full.
 
+Because those six defects escaped static inspection entirely, that end-to-end run is no longer a
+manual exercise. It is codified as `scripts/validate_production_compose.sh` and is a mandatory
+release gate, run locally and in CI on every pull request and every push to `main` as the
+**Validate the production Compose stack** check. CI builds and exercises the stack but never
+publishes it.
+
 Publication of a prebuilt image nonetheless remains blocked, because publishing an image is a durable
-claim about vulnerability status while a clean scan is a single point-in-time observation. The base
-digests must be re-resolved and rescanned immediately before release, and the rebuild plus
-integration test must be repeated against the actual release commit.
+claim about vulnerability status while a clean scan is a single point-in-time observation: a clean run
+describes one commit, one image ID, and one vulnerability database, and says nothing about the next
+build. The base digests must be re-resolved and rescanned immediately before release, and the
+integration gate must pass on the actual release commit before any tag or image is published.
+Publishing a prebuilt image remains a separate explicit release action rather than a CI side effect.
 
 ## Release preparation present
 

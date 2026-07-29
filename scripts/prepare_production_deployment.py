@@ -54,9 +54,14 @@ def ensure_secret(path: Path, value: str, *, force: bool) -> str:
         # in-place upgrade does not silently keep failing at startup.
         path.chmod(SECRET_FILE_MODE)
         return existing
-    open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    # Secrets are stored read-only, so an existing one cannot be reopened for writing and
+    # --force rotation would fail with EACCES. Remove it and create the replacement
+    # exclusively, which also means the write can never land on a path that changed after
+    # the symlink check above.
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         open_flags |= os.O_NOFOLLOW
+    path.unlink(missing_ok=True)
     descriptor = os.open(path, open_flags, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as secret_file:
         secret_file.write(value)

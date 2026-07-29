@@ -83,10 +83,23 @@ Because every workflow runs on `pull_request` rather than `pull_request_target`,
 fork executes with a read-only token in the fork's context and receives no repository secret. No
 workflow consumes a secret, so no generated artifact can contain one.
 
-The workflow set is `ci.yml`, `codeql.yml`, `container-scan.yml`, `dependency-review.yml`,
-`lock-freshness.yml`, and `sbom.yml`. `tests/test_release_tooling.py` asserts that the
-security-relevant workflows exist, validates whatever is on disk rather than a hard-coded count, and
-asserts that no step uses `continue-on-error` or otherwise swallows a failure.
+The workflow set is `ci.yml`, `codeql.yml`, `compose-integration.yml`, `container-scan.yml`,
+`dependency-review.yml`, `lock-freshness.yml`, and `sbom.yml`. `tests/test_release_tooling.py`
+asserts that the security-relevant workflows exist, validates whatever is on disk rather than a
+hard-coded count, and asserts that no step uses `continue-on-error` or otherwise swallows a failure.
+
+`compose-integration.yml` runs `scripts/validate_production_compose.sh`, which builds the
+production image and runs the documented production Compose profile end to end. It exists because
+six deployment defects reached a committed state after passing a full static audit; reading YAML
+cannot detect an unloadable project, an unreadable mounted secret, a rejected health probe, an
+overridden image healthcheck, a trust anchor that fails to load, or an implicit network. It builds
+and exercises the stack but publishes nothing: it holds only `contents: read`, consumes no secret,
+uses `pull_request` rather than `pull_request_target`, generates and discards every credential it
+needs, and performs no registry login or push. On failure it uploads container names, states, and
+Docker versions for seven days; container logs are excluded from the artifact because the script
+already emits them through the application's redaction filter. Publishing a prebuilt image remains a
+separate, explicit release action governed by
+[`container-image-security.md`](container-image-security.md), never a side effect of CI.
 
 ## SBOM
 

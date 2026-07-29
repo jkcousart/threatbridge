@@ -161,6 +161,48 @@ The comparison never suppresses vulnerability findings and never selects a base 
 exits non-zero unless every candidate's Trivy scan passes the documented HIGH/CRITICAL policy, so a
 blocked or skipped scan cannot be mistaken for a pass.
 
+### Prove the whole stack runs, not just that it parses
+
+Rendering Compose and validating the image are both static. Neither can tell you the stack
+starts. Six defects in this deployment path were found only by running it: an invalid
+`pids_limit` pairing that made the project unloadable, `0600` secret files UID 65532 could not
+read, a health probe Django answered `400` and then `301`, a Compose healthcheck that silently
+replaced the image's, a private CA that mounted unreadable while `web` still reported healthy,
+and `deploy-check` on an implicit egress-capable network. Every one of them passed YAML review.
+
+Before changing this deployment, and before any release, run the integration gate:
+
+```bash
+bash scripts/validate_production_compose.sh
+```
+
+This is a self-contained rehearsal of the instructions on this page, not a check against your
+deployment. It generates its own settings and secrets in a mode `0700` directory under `/tmp`,
+uses `.localhost` and `.invalid` names, publishes on a free loopback port, runs under a unique
+Compose project name, and tears everything down with
+`docker compose down --volumes --remove-orphans`. It never reads `deploy/.env.production`,
+`deploy/secrets/`, or your database, so it is safe to run on a host that already has a
+deployment, and it never publishes an image.
+
+It asserts the live contract this document describes: `deploy-check` and `migrate` exit `0`
+before `web` starts, `web` becomes healthy through the image's own probe, all three
+application services run as `65532:65532` with a read-only root filesystem, empty
+effective/permitted/bounding capability sets, `NoNewPrivs=1`, and `PidsLimit=256`, only `/tmp`
+and `/app/data` are writable, no container has a Docker socket, PostgreSQL is unpublished and
+cannot resolve external names, `deploy-check` runs with `network_mode: none`, the published
+port is bound to `127.0.0.1` only, `healthz` and `readyz` return `200`, `/` and `/admin/` still
+redirect to HTTPS, and an unapproved `Host` header is rejected with `400`. A second phase
+repeats this against `compose.production.step-ca.yml` and proves a readable private CA is
+*added* to the public trust store rather than replacing it, and that an unreadable one fails
+`deploy-check` instead of degrading silently. TLS verification is never disabled.
+
+Prerequisites are Docker with Compose v2 and buildx, `openssl`, the project virtual
+environment, and Trivy 0.70.0 (`bash scripts/install_trivy.sh`). A missing prerequisite fails
+the run with a clear message; no phase is ever skipped. Pass `base` to stop after the first
+phase, or set `THREATBRIDGE_KEEP_INTEGRATION_ARTIFACTS=1` to keep the temporary directory when
+diagnosing a failure. On failure the script prints service state and the last 60 log lines per
+service through the application's own redaction filter.
+
 ## 3. Start the stack
 
 ```bash

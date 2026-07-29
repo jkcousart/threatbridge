@@ -61,21 +61,39 @@ This checklist prepares a release candidate; completing it does not itself autho
 - [ ] A base-image change is accompanied by a fresh build, the full test suite, container validation,
       image SBOM, and an unsuppressed scan of the new image ID. A previous base's evidence is never
       carried forward.
-- [ ] The production Compose stack is started end to end against the rebuilt image, with migrations
-      and readiness confirmed, before any prebuilt image is considered publishable. Run this on the
-      actual release commit; a passing run on an earlier commit is not evidence about the release.
-- [ ] `docker compose config` exits zero for the production profile and for the step-ca overlay.
-      Compose enforces semantics that parsing the YAML cannot, so a profile that only passes the unit
-      tests may still be an invalid project.
-- [ ] `deploy-check` and `migrate` both exit zero and `web` reaches `healthy`. A container stuck at
-      `starting` or reaching `unhealthy` is a release blocker, not a timing artefact.
-- [ ] Generated secret files are readable by UID 65532 and their directory is mode `0700`. If a
-      private CA is configured, the certificate is mode `0444`. Compose ignores `uid`, `gid`, and
-      `mode` outside Swarm, so an owner-only file mounts unreadable.
-- [ ] With a private CA configured, confirm the certificate is actually present in the running
-      container's trust store rather than assuming the mount succeeded.
-- [ ] `/readyz` and `/healthz` return `200` over plain HTTP with a configured `Host`, a data-carrying
-      path such as `/admin/` still returns `301`, and an unrecognised `Host` still returns `400`.
+- [ ] **`bash scripts/validate_production_compose.sh` passes on the actual release commit.** This is
+      the mandatory live-deployment gate and it subsumes the checks listed immediately below. A
+      passing run on an earlier commit is not evidence about the release, because a clean run
+      describes one commit, one image ID, and one scanner database.
+
+      The gate asserts all of the following, so they no longer need separate manual confirmation.
+      Confirm them by reading its output rather than by repeating the commands:
+
+  - [ ] `docker compose config` exits zero for the production profile and for the step-ca overlay.
+        Compose enforces semantics that parsing the YAML cannot, so a profile that only passes the
+        unit tests may still be an invalid project.
+  - [ ] `deploy-check` and `migrate` both exit zero and `web` reaches `healthy` through the image's
+        own probe. A container stuck at `starting` or reaching `unhealthy` is a release blocker, not
+        a timing artefact.
+  - [ ] Generated secret files are readable by UID 65532 and their directory is mode `0700`; a
+        private CA certificate is mode `0444`. Compose ignores `uid`, `gid`, and `mode` outside
+        Swarm, so an owner-only file mounts unreadable.
+  - [ ] A configured private CA is actually present in the running container's trust store, is
+        *added* to public trust rather than replacing it, and an unreadable certificate fails
+        `deploy-check` instead of degrading silently. Verification is never disabled to make this
+        pass.
+  - [ ] `/readyz` and `/healthz` return `200` over plain HTTP with a configured `Host`, a
+        data-carrying path such as `/admin/` still returns `301`, and an unrecognised `Host` still
+        returns `400`.
+  - [ ] Every application service runs as `65532:65532` with a read-only root filesystem, empty
+        effective/permitted/bounding capability sets, `NoNewPrivs=1`, and `PidsLimit=256`; only
+        `/tmp` and `/app/data` are writable; no container holds a Docker socket; PostgreSQL is
+        unpublished with no egress; `deploy-check` runs with `network_mode: none`; and the published
+        port is bound to `127.0.0.1` only.
+
+- [ ] The GitHub **Validate the production Compose stack** check passes on the pushed release commit,
+      in addition to the local run. CI builds and exercises the stack but never publishes it;
+      publishing a prebuilt image remains a separate explicit action.
 - [ ] CodeQL and dependency review have run successfully on the intended public host where
       supported.
 
@@ -99,8 +117,9 @@ publication.
 - [ ] Dependabot alerts, security updates, and version updates are enabled.
 - [ ] CodeQL default or advanced setup is active and its alerts are triaged.
 - [ ] Branch protection on the default branch requires pull requests, review, passing status checks
-      including `Test, lint, and security`, `Container and filesystem scan`, `CodeQL`, and
-      `Dependency review`, and blocks force pushes and deletion.
+      including `Test, lint, and security`, `Container and filesystem scan`,
+      `Validate the production Compose stack`, `CodeQL`, and `Dependency review`, and blocks force
+      pushes and deletion.
 - [ ] Actions permissions are restricted to selected actions, and `GITHUB_TOKEN` defaults to
       read-only with pull-request write disabled.
 - [ ] Workflows from forked pull requests require approval from a maintainer.

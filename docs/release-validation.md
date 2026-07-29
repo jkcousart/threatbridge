@@ -179,6 +179,32 @@ passed identical ownership and permissions inspection. Bookworm did not material
 blocking findings; it increased the critical and total counts and was larger. The reviewed current
 slim digest was therefore retained.
 
+## Superseded by the production Compose integration gate
+
+Everything above was assembled by hand. That is precisely why it is no longer the release
+evidence of record: the Docker validation in this document proved the *image* worked, and
+six defects in the *deployment* still reached a committed state afterwards, because no
+step here ever started the production stack.
+
+The authoritative gate is now a single script:
+
+```bash
+bash scripts/validate_production_compose.sh
+```
+
+It performs the image validation, SBOM generation, and unsuppressed scan recorded above,
+and then does what this run did not: renders the production Compose project, starts the
+complete stack on a disposable loopback-only deployment, and asserts the live runtime
+contract, HTTP behaviour, network isolation, and private-CA handling. It is a mandatory
+release gate, and it runs in CI on every pull request and every push to `main` as the
+**Validate the production Compose stack** check in
+`.github/workflows/compose-integration.yml`.
+
+Its output has the same point-in-time limits as the evidence above. A clean run describes
+one commit, one image ID, and one scanner database; it is not evidence about a later build.
+The release commit itself must pass the gate before a tag or image is published, and CI
+builds and exercises the stack without ever publishing it.
+
 ## Remaining release boundaries
 
 The locks, base digest, action SHAs, and SBOM make inputs reviewable and repeatable for the tested

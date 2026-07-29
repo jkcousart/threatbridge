@@ -427,6 +427,50 @@ python manage.py migrate
 python manage.py seed_demo
 ```
 
+### Production Compose integration gate
+
+The checks above are static. They cannot tell whether the production stack actually
+starts, because a Compose file can parse perfectly and still refuse to run. Six such
+defects reached a committed state after passing a full static audit: an invalid
+`pids_limit` pairing, secret files the container user could not read, a health probe
+Django answered `400` and then `301`, a Compose healthcheck that silently replaced the
+image's, a private CA that mounted unreadable while the stack still reported healthy, and
+a deployment gate on an implicit egress-capable network.
+
+One command now runs the documented production profile end to end and is the authoritative
+gate for both developers and CI:
+
+```bash
+bash scripts/validate_production_compose.sh
+```
+
+It builds the committed Dockerfile default, validates the image, generates the SBOM, runs
+the unsuppressed vulnerability scan, renders and starts the full stack, and then asserts
+the live runtime contract: non-root identity, read-only root filesystem, empty capability
+sets, `NoNewPrivs`, `PidsLimit=256`, writable paths limited to `/tmp` and `/app/data`, no
+Docker socket, an unpublished and egress-free database, `deploy-check` on
+`network_mode: none`, and a published port bound only to `127.0.0.1`. It also verifies that
+`healthz` and `readyz` return `200` while `/` and `/admin/` still redirect to HTTPS and an
+unapproved `Host` header is rejected with `400`, then repeats the run against
+`compose.production.step-ca.yml` to prove a private CA extends public trust when readable
+and fails the deployment closed when it is not.
+
+Everything it uses is disposable: generated test-only secrets under a mode `0700` directory
+in `/tmp`, `.localhost` and `.invalid` names, a loopback-only port, and a unique Compose
+project torn down with `docker compose down --volumes --remove-orphans`. It never reads the
+repository's `.env`, `.secrets/`, `deploy/` state, or `db.sqlite3`, and it never publishes
+an image. Prerequisites are Docker with Compose v2 and buildx, `openssl`, the project
+virtual environment, and Trivy 0.70.0 from `scripts/install_trivy.sh`; a missing
+prerequisite fails the run rather than skipping a phase.
+
+Pass `base` to stop after the first phase, or set
+`THREATBRIDGE_KEEP_INTEGRATION_ARTIFACTS=1` to keep the temporary directory for debugging.
+The same script runs in CI as the **Validate the production Compose stack** check in
+[`.github/workflows/compose-integration.yml`](.github/workflows/compose-integration.yml),
+on every pull request and every push to `main`. Passing it is a mandatory release gate: a
+clean run is evidence about the exact commit that produced it, so the release commit itself
+must pass before any tag or image is published.
+
 ## Licence
 
 ThreatBridge is prepared for distribution under the

@@ -1,0 +1,94 @@
+name: Production Compose integration
+
+# Six deployment defects reached a committed state after passing a full static audit,
+# because parsing compose YAML cannot detect an invalid project, an unreadable mounted
+# secret, a health probe the application refuses, an overridden image healthcheck, a trust
+# anchor that fails to load, or an implicit network. This job runs the documented
+# production profile end to end so those failures surface here instead of in a deployment.
+#
+# It builds and exercises the stack. It never publishes an image, never pushes anything,
+# and never consumes a credential: every secret is generated and thrown away, and the
+# published port is bound to loopback only.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Validate the production Compose stack
+    runs-on: ubuntu-24.04
+    # A hung stack must not hold the runner. The script applies its own bounded waits, so
+    # this is the outer backstop.
+    timeout-minutes: 45
+    env:
+      TRIVY_BIN: /tmp/threatbridge-trivy-0.70.0/trivy
+      TRIVY_CACHE_DIR: /tmp/threatbridge-trivy-cache
+      THREATBRIDGE_VENV: .venv
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: 3.13.14
+      - name: Create the project virtual environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --require-hashes -r requirements/build.txt
+          .venv/bin/python -m pip install --require-hashes -r requirements/development.txt
+          .venv/bin/python -m pip install --no-deps --no-build-isolation .
+      - name: Validate committed dependency locks without resolution
+        run: .venv/bin/python scripts/validate_dependency_locks.py
+      - name: Validate workflow policy
+        run: .venv/bin/python scripts/validate_workflows.py
+      - name: Install checksum-verified Trivy
+        run: bash scripts/install_trivy.sh "$(dirname "${TRIVY_BIN}")"
+      - name: Confirm the integration prerequisites are present
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+          openssl version
+      # The single authoritative gate. Everything it checks lives in the script rather
+      # than in this workflow, so a developer runs exactly what CI runs.
+      - name: Run the production Compose integration gate
+        run: bash scripts/validate_production_compose.sh all
+      - name: Collect redacted diagnostics
+        if: failure()
+        run: |
+          diagnostics=/tmp/compose-integration-diagnostics
+          mkdir -p "${diagnostics}"
+          # Names, states, and exit codes only. Container logs are deliberately excluded:
+          # the script already prints them to this job's log through the application's own
+          # redaction filter, and re-collecting them into an artifact would risk publishing
+          # an unredacted copy. Failures here are not suppressed; the job has already
+          # failed, and a broken Docker CLI is itself worth surfacing.
+          docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' \
+            >"${diagnostics}/containers.txt"
+          docker network ls --format '{{.Name}}\t{{.Driver}}\t{{.Scope}}' \
+            >"${diagnostics}/networks.txt"
+          {
+            docker version --format 'docker {{.Server.Version}}'
+            printf 'compose %s\n' "$(docker compose version --short)"
+          } >"${diagnostics}/versions.txt"
+      - name: Upload redacted diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: compose-integration-diagnostics
+          path: /tmp/compose-integration-diagnostics
+          retention-days: 7
+          if-no-files-found: ignore

@@ -627,6 +627,32 @@ def test_prepare_production_deployment_repairs_unreadable_existing_secrets(
         assert path.read_text(encoding="utf-8") == original
 
 
+def test_prepare_production_deployment_can_rotate_read_only_secrets(tmp_path: Path) -> None:
+    """Rotation has to work against the read-only mode the secrets are stored with.
+
+    A 0444 file cannot be reopened for writing, so --force previously failed with EACCES
+    on any deployment that had already been prepared.
+    """
+
+    first = run_prepare(tmp_path)
+    assert first.returncode == 0, first.stderr
+    secrets_dir = tmp_path / "secrets"
+    before = {
+        name: (secrets_dir / name).read_text(encoding="utf-8")
+        for name in ("django-secret-key", "database-url", "postgres-password")
+    }
+
+    rotated = run_prepare(tmp_path, "--force")
+    assert rotated.returncode == 0, rotated.stderr
+    for name, original in before.items():
+        path = secrets_dir / name
+        assert stat.S_IMODE(path.stat().st_mode) == 0o444, name
+        assert path.read_text(encoding="utf-8") != original, name
+    # The rotated URL must still embed the rotated password, or the stack cannot connect.
+    password = (secrets_dir / "postgres-password").read_text(encoding="utf-8").strip()
+    assert password in (secrets_dir / "database-url").read_text(encoding="utf-8")
+
+
 def test_prepare_production_deployment_refuses_group_or_world_writable_secrets(
     tmp_path: Path,
 ) -> None:
