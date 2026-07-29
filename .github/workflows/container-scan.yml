@@ -1,0 +1,87 @@
+name: Container and filesystem scan
+
+on:
+  push:
+    paths:
+      - Dockerfile
+      - compose*.yml
+      - requirements/**
+      - pyproject.toml
+      - scripts/install_trivy.sh
+      - scripts/scan_container_image.sh
+      - scripts/validate_container_image.sh
+      - scripts/evaluate_trivy_report.py
+      - .github/workflows/container-scan.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - compose*.yml
+      - requirements/**
+      - pyproject.toml
+      - scripts/install_trivy.sh
+      - scripts/scan_container_image.sh
+      - scripts/validate_container_image.sh
+      - scripts/evaluate_trivy_report.py
+      - .github/workflows/container-scan.yml
+  schedule:
+    - cron: "41 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TRIVY_BIN: /tmp/threatbridge-trivy-0.70.0/trivy
+      TRIVY_CACHE_DIR: /tmp/threatbridge-trivy-cache
+      THREATBRIDGE_VENV: .venv
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: 3.13.14
+      - name: Create the virtual environment the scan scripts expect
+        run: python -m venv .venv
+      - name: Install checksum-verified Trivy
+        run: bash scripts/install_trivy.sh "$(dirname "${TRIVY_BIN}")"
+      # Dependency vulnerabilities are covered by pip-audit in ci.yml, which understands
+      # the requirements/*.txt lock layout. This step covers committed secrets, which
+      # nothing else in CI checks.
+      - name: Scan the repository for committed secrets
+        run: |
+          "${TRIVY_BIN}" filesystem \
+            --cache-dir "${TRIVY_CACHE_DIR}" \
+            --ignorefile /dev/null \
+            --scanners secret \
+            --exit-code 1 \
+            --skip-dirs .git \
+            .
+      - name: Scan the Dockerfile for misconfiguration
+        run: |
+          "${TRIVY_BIN}" config \
+            --cache-dir "${TRIVY_CACHE_DIR}" \
+            --ignorefile /dev/null \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --exit-code 1 \
+            .
+      - name: Build the production image from the pinned base digests
+        run: |
+          docker build \
+            --build-arg "THREATBRIDGE_REVISION=${GITHUB_SHA}" \
+            --build-arg "THREATBRIDGE_CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag threatbridge:scan .
+      - name: Validate image identity, permissions, and runtime confinement
+        run: bash scripts/validate_container_image.sh threatbridge:scan
+      - name: Scan the built image and fail on HIGH or CRITICAL findings
+        run: bash scripts/scan_container_image.sh threatbridge:scan /tmp/image-vulnerabilities.json

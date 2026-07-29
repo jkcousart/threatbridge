@@ -309,6 +309,112 @@ class AuthorizationMatrixTests(TestCase):
             statuses.add(response.status_code)
         self.assertEqual(statuses, {403})
 
+    def test_every_state_changing_endpoint_denies_callers_without_its_permission(self):
+        """Each mutating route is exercised with a user who holds no relevant grant."""
+
+        def upload():
+            return SimpleUploadedFile(
+                "assets.csv",
+                b"device_id,device_name\nasset-1,server.example.invalid\n",
+                content_type="text/csv",
+            )
+
+        cases = (
+            (self.ordinary, "post", "/api/file-imports/preview/", {"file": upload()}),
+            (self.ordinary, "post", "/api/file-imports/", {"file": upload()}),
+            (
+                self.importer,
+                "post",
+                "/api/integrations/",
+                {
+                    "name": "Unauthorized profile",
+                    "slug": "unauthorized-profile",
+                    "adapter_path": "integrations.adapters.demo.DemoAdapter",
+                },
+            ),
+            (
+                self.importer,
+                "patch",
+                f"/api/integrations/{self.integration.pk}/",
+                {"name": "Renamed without permission"},
+            ),
+            (
+                self.restorer,
+                "post",
+                f"/api/external-objects/{self.report_source.pk}/delete-evidence/",
+                None,
+            ),
+            (
+                self.ordinary,
+                "post",
+                f"/api/catalog/threat-reports/{self.report.pk}/assess/",
+                None,
+            ),
+            (
+                self.ordinary,
+                "post",
+                f"/api/catalog/threat-report-techniques/{self.mapping.pk}/approve/",
+                None,
+            ),
+            (
+                self.ordinary,
+                "post",
+                f"/api/catalog/threat-report-techniques/{self.mapping.pk}/reject/",
+                None,
+            ),
+        )
+        for user, method, path, payload in cases:
+            with self.subTest(surface="rest", user=user.username, path=path):
+                api = self._api_for(user)
+                if payload is None:
+                    response = getattr(api, method)(path)
+                elif "file" in payload:
+                    response = getattr(api, method)(path, payload, format="multipart")
+                else:
+                    response = getattr(api, method)(path, payload, format="json")
+                self.assertEqual(response.status_code, 403, response.content[:200])
+
+    def test_read_endpoints_for_restricted_evidence_deny_unprivileged_callers(self):
+        api = self._api_for(self.ordinary)
+        self.assertEqual(api.get("/api/external-objects/").status_code, 403)
+
+        browser = Client()
+        browser.force_login(self.ordinary)
+        self.assertEqual(browser.get("/evidence/").status_code, 403)
+
+    def test_anonymous_mutations_are_refused_on_both_surfaces(self):
+        api = APIClient()
+        api_paths = (
+            "/api/file-imports/",
+            "/api/file-imports/preview/",
+            "/api/integrations/",
+            f"/api/integrations/{self.integration.pk}/test/",
+            f"/api/integrations/{self.integration.pk}/sync/",
+            f"/api/catalog/threat-reports/{self.report.pk}/assess/",
+            "/api/catalog/threat-reports/manual/",
+            f"/api/external-objects/{self.report_source.pk}/delete-evidence/",
+            f"/api/external-objects/{self.report_source.pk}/restore/",
+        )
+        for path in api_paths:
+            with self.subTest(surface="rest", path=path):
+                self.assertIn(api.post(path).status_code, {401, 403})
+
+        browser = Client()
+        browser_paths = (
+            "/imports/new/",
+            "/imports/preview/",
+            f"/integrations/{self.integration.pk}/test/",
+            f"/integrations/{self.integration.pk}/sync/",
+            f"/reports/{self.report.pk}/assess/",
+            f"/report-techniques/{self.mapping.pk}/review/",
+        )
+        for path in browser_paths:
+            with self.subTest(surface="browser", path=path):
+                response = browser.post(path)
+                self.assertIn(response.status_code, {302, 403})
+                if response.status_code == 302:
+                    self.assertIn("/accounts/login/", response["Location"])
+
     def test_session_api_mutation_remains_csrf_protected(self):
         client = Client(enforce_csrf_checks=True)
         client.force_login(self.importer)

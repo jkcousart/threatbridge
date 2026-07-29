@@ -66,17 +66,35 @@ Useful routes:
 
 ## Docker Compose
 
+The default Compose file remains a local-development stack:
+
 ```bash
 docker compose up --build -d
 docker compose exec web python manage.py createsuperuser
 docker compose exec web python manage.py seed_demo
 ```
 
-Then open `http://127.0.0.1:8000/`.
+Then open `http://127.0.0.1:8000/`. The development profile publishes only on `127.0.0.1:8000`,
+generates a persistent local Django secret inside the container, and uses an intentionally
+well-known local database password. Do not expose this profile.
 
-The Compose values are for local evaluation only. Development mode generates a persistent local
-Django secret inside the container. Before using a shared environment, replace the database
-password, set `DJANGO_DEBUG=false`, and provide `DJANGO_SECRET_KEY` explicitly.
+For a shared or homelab deployment, use `compose.production.yml`. It provides a non-root application
+image, immutable image digests, file-backed secrets, a deployment-check gate and a one-shot migration
+service before the web service starts, an internal-only PostgreSQL network, read-only application
+containers with all capabilities dropped and `no-new-privileges`, per-service CPU/memory/PID limits,
+health checks, log rotation, and backup/restore helpers. It publishes nothing until you set
+`THREATBRIDGE_BIND_ADDRESS`; the documented default is `127.0.0.1:8020`, intended to sit behind a
+reverse proxy that terminates TLS. See [`deploy/README.md`](deploy/README.md) for the complete
+procedure and [`docs/deployment-hardening.md`](docs/deployment-hardening.md) for the control set.
+
+The default builder and runtime base is the publicly pullable Docker Official Image
+`python:3.13.14-alpine3.24`, pinned by digest. It is the default because that exact candidate built
+from the committed hash-locked requirements, passed runtime confinement validation, and recorded zero
+HIGH or CRITICAL findings in the reviewed Trivy 0.70.0 scan — point-in-time evidence about one image
+and one scanner database, not a promise about future scans. Building from a hardened, mirrored, or
+private base stays supported through `THREATBRIDGE_BUILDER_TAG` and `THREATBRIDGE_RUNTIME_TAG`. See
+[`docs/container-image-security.md`](docs/container-image-security.md) for the base comparison, the
+musl compatibility scope, and the upgrade procedure.
 
 ## Importing CSV and JSON
 
@@ -305,15 +323,22 @@ from this release.
 | Variable | Purpose | Default |
 |---|---|---|
 | `DJANGO_DEBUG` | Development mode | `true` |
-| `DJANGO_SECRET_KEY` | Django signing key; required outside development | Generated in `.secrets/` during development |
+| `DJANGO_SECRET_KEY` | Django signing key; required outside development unless its file form is used | Generated in `.secrets/` during development |
+| `DJANGO_SECRET_KEY_FILE` | Absolute non-symlink file containing the Django signing key | Empty |
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated hosts | `localhost,127.0.0.1` |
 | `DJANGO_CSRF_TRUSTED_ORIGINS` | Comma-separated origins | Empty |
 | `DJANGO_SECURE_HSTS_SECONDS` | Explicit production HSTS duration | Required in production |
+| `DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS` | Extend HSTS to subdomains; rejected while the duration is zero | `false` |
+| `DJANGO_SECURE_HSTS_PRELOAD` | Request preload; requires a full year and subdomain inclusion | `false` |
 | `DJANGO_TRUST_X_FORWARDED_PROTO` | Trust a stripping proxy's forwarded HTTPS header | `false` |
+| `DJANGO_LOG_LEVEL` | Application log level; every handler redacts credentials | `INFO` |
 | `DJANGO_TIME_ZONE` | Display/default timezone | `UTC` |
-| `DATABASE_URL` | SQLite or PostgreSQL connection | Local SQLite |
+| `DATABASE_URL` | SQLite or PostgreSQL connection; mutually exclusive with its file form | Local SQLite |
+| `DATABASE_URL_FILE` | Absolute non-symlink file containing the database URL | Empty |
 | `THREATBRIDGE_DATA_DIR` | Connector and upload data directory | `./data` |
-| `THREATBRIDGE_MAX_UPLOAD_BYTES` | Multipart file-size limit | `52428800` |
+| `THREATBRIDGE_MAX_UPLOAD_BYTES` | Multipart file-size limit; also bounds Django's request body | `52428800` |
+| `THREATBRIDGE_MAX_REQUEST_FIELDS` | Maximum form fields in one request | `200` |
+| `THREATBRIDGE_MAX_REQUEST_FILES` | Maximum uploaded files in one request | `10` |
 | `THREATBRIDGE_MAX_IMPORT_RECORDS` | Records allowed in one file import | `100000` |
 | `THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES` | Maximum connector response body | `10485760` |
 | `THREATBRIDGE_MAX_JSON_DEPTH` | Maximum imported JSON nesting | `20` |
@@ -329,15 +354,26 @@ from this release.
 | `THREATBRIDGE_ALLOWED_ADAPTER_PREFIXES` | Allowed Python adapter namespaces | `integrations.adapters.` |
 | `THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS` | Exact connector destination hostnames or IP literals | Empty |
 | `THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS` | Private CIDRs permitted for exact allowlisted hosts | Empty |
+| `THREATBRIDGE_EXTRA_CA_FILE` | Additional reviewed CA certificate added to the default TLS trust store | Empty |
+| `THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT` | Connector TCP/TLS connect timeout, capped by the read timeout | `10` |
+| `THREATBRIDGE_ANON_THROTTLE_RATE` | REST API rate limit for anonymous callers | `30/minute` |
+| `THREATBRIDGE_USER_THROTTLE_RATE` | REST API rate limit for authenticated callers | `600/minute` |
 
 ## Security boundaries
 
+- **ThreatBridge is not a malware sandbox.** Imported files are parsed as data, never executed,
+  detonated, unpacked, or emulated.
+- **Docker reduces deployment risk but is not an absolute security boundary.** Containers share the
+  host kernel; treat the container profile as defence in depth, not isolation for hostile code.
+- **Nothing is exposed publicly by default.** The development profile binds `127.0.0.1:8000`; the
+  production profile publishes only on a bind address you set explicitly and expects a reverse proxy
+  to terminate TLS.
 - External integrations are read-only by design.
 - File uploads require a named permission and enforce byte, record, structure, nesting, field,
   line, preview, and retained-error limits under a server-controlled path.
 - Uploaded filenames are not used as storage paths; ThreatBridge generates random names and stores the original name as metadata.
 - Credentials are not stored in integration configuration. `secret_reference` resolves credentials from an external source such as environment variables.
-- Every connector destination requires an exact outbound-host allowlist entry. Private destinations additionally require every DNS answer to fall within an explicitly allowed private CIDR.
+- Every connector destination requires an exact outbound-host allowlist entry. Private destinations additionally require every DNS answer to fall within an explicitly allowed private CIDR. Loopback, link-local, cloud-metadata, multicast, unspecified, and IPv4-embedding tunnel addresses are always refused, resolved addresses are revalidated immediately before connection, redirects are re-validated and capped, and certificate verification is never disabled. A private CA is added with `THREATBRIDGE_EXTRA_CA_FILE`.
 - Connector response bodies are bounded before complete in-memory loading, and stored/displayed
   connector failures omit bodies, query strings, headers, and resolved secrets.
 - Each `ExternalObject` row retains the latest raw and normalized version for its integration/type/external-ID key, with a content hash and provenance timestamps; it is not an append-only version history.
@@ -350,17 +386,37 @@ from this release.
 - Security audit events and ATT&CK review events are append-only through application and admin
   paths, with bounded redacted metadata.
 - Write-back, automatic blocking, rule deployment, scan execution, and remediation are outside the MVP.
+- Authorization is role-based and global rather than per-object: a user holding a named permission can
+  act on every object of that type.
+- Every logging handler, including Gunicorn's access log, redacts `Authorization` and `Cookie`
+  headers, bearer/basic/token credentials, URL userinfo, and sensitive query parameters.
+- SQLite is a development convenience only. Production requires PostgreSQL and startup refuses any
+  other database; see [`docs/deployment-hardening.md`](docs/deployment-hardening.md) for durability
+  and backup expectations.
 - Do not ingest PHI, patient records, secrets, access tokens, or private keys.
 - Malware scanning and quarantine are not implemented. Production deployments must add both before accepting untrusted uploads.
 
-Production requirements and fail-closed settings are documented in
-[`docs/deployment-hardening.md`](docs/deployment-hardening.md). Tenant isolation, organization
-scoping, Entra ID/enterprise SSO, full TLP enforcement, automatic policy decisions, connector
-write-back, and automatic remediation are not implemented.
+ThreatBridge is aligned with, and informed by, the CIS Docker Benchmark, OWASP container security
+guidance, OpenSSF repository practices, and Django deployment guidance. It is not certified against
+any of them.
+
+Production requirements and fail-closed settings, the split between repository-enforced and
+host-administrator-enforced controls, and the residual-risk list are documented in
+[`docs/deployment-hardening.md`](docs/deployment-hardening.md). The threat model and SSRF policy are
+in [`docs/security-architecture.md`](docs/security-architecture.md), and vulnerability reporting is in
+[`SECURITY.md`](SECURITY.md). Tenant isolation, organization scoping, Entra ID/enterprise SSO, full
+TLP enforcement, automatic policy decisions, connector write-back, and automatic remediation are not
+implemented.
 
 ## Tests and checks
 
 ```bash
+python -m pytest
+python -m ruff check .
+python -m ruff format --check .
+python manage.py check
+python scripts/validate_dependency_locks.py
+python scripts/validate_workflows.py
 bash scripts/security_check.sh
 ```
 
@@ -370,6 +426,50 @@ A clean smoke test can also be run with:
 python manage.py migrate
 python manage.py seed_demo
 ```
+
+### Production Compose integration gate
+
+The checks above are static. They cannot tell whether the production stack actually
+starts, because a Compose file can parse perfectly and still refuse to run. Six such
+defects reached a committed state after passing a full static audit: an invalid
+`pids_limit` pairing, secret files the container user could not read, a health probe
+Django answered `400` and then `301`, a Compose healthcheck that silently replaced the
+image's, a private CA that mounted unreadable while the stack still reported healthy, and
+a deployment gate on an implicit egress-capable network.
+
+One command now runs the documented production profile end to end and is the authoritative
+gate for both developers and CI:
+
+```bash
+bash scripts/validate_production_compose.sh
+```
+
+It builds the committed Dockerfile default, validates the image, generates the SBOM, runs
+the unsuppressed vulnerability scan, renders and starts the full stack, and then asserts
+the live runtime contract: non-root identity, read-only root filesystem, empty capability
+sets, `NoNewPrivs`, `PidsLimit=256`, writable paths limited to `/tmp` and `/app/data`, no
+Docker socket, an unpublished and egress-free database, `deploy-check` on
+`network_mode: none`, and a published port bound only to `127.0.0.1`. It also verifies that
+`healthz` and `readyz` return `200` while `/` and `/admin/` still redirect to HTTPS and an
+unapproved `Host` header is rejected with `400`, then repeats the run against
+`compose.production.step-ca.yml` to prove a private CA extends public trust when readable
+and fails the deployment closed when it is not.
+
+Everything it uses is disposable: generated test-only secrets under a mode `0700` directory
+in `/tmp`, `.localhost` and `.invalid` names, a loopback-only port, and a unique Compose
+project torn down with `docker compose down --volumes --remove-orphans`. It never reads the
+repository's `.env`, `.secrets/`, `deploy/` state, or `db.sqlite3`, and it never publishes
+an image. Prerequisites are Docker with Compose v2 and buildx, `openssl`, the project
+virtual environment, and Trivy 0.70.0 from `scripts/install_trivy.sh`; a missing
+prerequisite fails the run rather than skipping a phase.
+
+Pass `base` to stop after the first phase, or set
+`THREATBRIDGE_KEEP_INTEGRATION_ARTIFACTS=1` to keep the temporary directory for debugging.
+The same script runs in CI as the **Validate the production Compose stack** check in
+[`.github/workflows/compose-integration.yml`](.github/workflows/compose-integration.yml),
+on every pull request and every push to `main`. Passing it is a mandatory release gate: a
+clean run is evidence about the exact commit that produced it, so the release commit itself
+must pass before any tag or image is published.
 
 ## Licence
 

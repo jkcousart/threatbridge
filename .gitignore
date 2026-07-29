@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!deploy/.env.production.example
 *.pem
 *.key
 *.p12
@@ -9,6 +10,9 @@
 *.jks
 secrets/
 .secrets/
+deploy/.env.production
+deploy/secrets/
+deploy/ca/
 
 # Python environments and generated files
 .venv/
@@ -35,14 +39,15 @@ coverage.xml
 htmlcov/
 security-reports/
 release-evidence/
-docs/security/tmkb*
-docs/security/*audit-report*
-docs/security/*hardening-report*
-docs/security/private-*
+# Private security work products are ignored by default so an internal report can never
+# be committed by accident. Publish a document by adding an explicit exception below.
+docs/security/*
+!docs/security/public-release-hardening-audit.md
 bandit-report.*
 pip-audit-report.*
 gitleaks-report.*
 *.log
+backups/
 .codex-*
 
 # Generated static and local incoming data

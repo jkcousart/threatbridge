@@ -1,0 +1,35 @@
+# Adds trust for one reviewed internal CA certificate. It never disables certificate
+# verification and never mounts a host certificate directory. The long syntax pins the
+# in-container path instead of relying on the Compose default target location.
+#
+# uid, gid, and mode apply under Swarm only. Plain `docker compose` warns that it ignores
+# them and mounts the host file with its own ownership and mode, so the certificate on the
+# host must itself be readable by 65532 (0444). prepare_production_deployment.py enforces
+# that, and an unreadable certificate fails the deploy-check gate rather than leaving the
+# private CA quietly absent from the trust store.
+x-extra-ca-config: &extra-ca-config
+  - source: threatbridge_extra_ca
+    target: /run/configs/threatbridge_extra_ca
+    uid: "65532"
+    gid: "65532"
+    mode: 0444
+
+services:
+  deploy-check:
+    environment:
+      THREATBRIDGE_EXTRA_CA_FILE: /run/configs/threatbridge_extra_ca
+    configs: *extra-ca-config
+
+  migrate:
+    environment:
+      THREATBRIDGE_EXTRA_CA_FILE: /run/configs/threatbridge_extra_ca
+    configs: *extra-ca-config
+
+  web:
+    environment:
+      THREATBRIDGE_EXTRA_CA_FILE: /run/configs/threatbridge_extra_ca
+    configs: *extra-ca-config
+
+configs:
+  threatbridge_extra_ca:
+    file: ${THREATBRIDGE_EXTRA_CA_PATH:?Set the host path to the reviewed internal CA certificate}

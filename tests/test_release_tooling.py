@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -36,11 +39,47 @@ def write_workflow(tmp_path: Path, source: str, *, name: str = "workflow.yml") -
 
 
 def test_current_workflows_are_valid() -> None:
-    workflow_count, action_count = validate_workflow_directory(
-        PROJECT_ROOT / ".github" / "workflows"
+    workflow_directory = PROJECT_ROOT / ".github" / "workflows"
+    workflow_count, action_count = validate_workflow_directory(workflow_directory)
+    # Derived from what is on disk rather than hard-coded, so adding a workflow or
+    # letting Dependabot bump a pinned action does not require editing this test.
+    on_disk = sorted(
+        (*workflow_directory.glob("*.yml"), *workflow_directory.glob("*.yaml"))
     )
-    assert workflow_count == 5
-    assert action_count == 11
+    assert workflow_count == len(on_disk)
+    assert action_count == sum(
+        1
+        for path in on_disk
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if "uses:" in line
+    )
+    assert action_count >= workflow_count
+
+
+def test_required_security_workflows_are_present() -> None:
+    workflow_directory = PROJECT_ROOT / ".github" / "workflows"
+    names = {path.name for path in workflow_directory.glob("*.yml")}
+    for required in (
+        "ci.yml",
+        "codeql.yml",
+        # Builds and validates the image; does not run the stack.
+        "container-scan.yml",
+        # Runs the documented production profile end to end. Static inspection let six
+        # deployment defects through, so this is a required gate rather than an extra.
+        "compose-integration.yml",
+        "dependency-review.yml",
+        "lock-freshness.yml",
+        "sbom.yml",
+    ):
+        assert required in names, required
+
+
+def test_no_workflow_silently_ignores_a_failing_step() -> None:
+    workflow_directory = PROJECT_ROOT / ".github" / "workflows"
+    for path in sorted(workflow_directory.glob("*.yml")):
+        source = path.read_text(encoding="utf-8")
+        for suppression in ("continue-on-error", "|| true", "set +e", "--exit-code 0"):
+            assert suppression not in source, (path.name, suppression)
 
 
 @pytest.mark.parametrize(
@@ -256,16 +295,83 @@ def test_development_lock_retains_runtime_artifact_hashes(tmp_path: Path) -> Non
 
 def test_docker_final_stage_uses_only_the_installed_wheel() -> None:
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    stages = dockerfile.split("\nFROM ")
-    assert len(stages) == 2
-    final_stage = stages[1]
+    assert "ARG PYTHON_BUILDER_IMAGE=" in dockerfile
+    assert "ARG PYTHON_RUNTIME_IMAGE=" in dockerfile
+    marker = "FROM ${PYTHON_RUNTIME_IMAGE} AS runtime"
+    assert marker in dockerfile
+    final_stage = dockerfile.split(marker, 1)[1]
     assert "COPY . ." not in final_stage
-    assert "COPY manage.py LICENSE NOTICE /app/" in final_stage
-    assert "test ! -e /app/threatbridge" in final_stage
-    assert "sysconfig.get_paths()" in final_stage
+    assert (
+        "COPY --from=builder --chown=65532:65532 "
+        "/opt/runtime-venv /opt/runtime-venv"
+    ) in final_stage
+    assert "COPY --from=builder --chown=65532:65532 /runtime/app /app" in final_stage
+    assert "USER 65532:65532" in final_stage
+    assert "ENTRYPOINT []" in final_stage
+    assert "\nRUN " not in final_stage
+    assert "sysconfig.get_paths()" in dockerfile
 
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'exclude = ["*.tests", "*.tests.*"]' in pyproject
+
+
+def test_wheel_validation_cannot_be_satisfied_by_the_build_directory(
+    tmp_path: Path,
+) -> None:
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    # The builder copies the source trees into its working directory, which is exactly
+    # what the validation must not be allowed to import.
+    assert "WORKDIR /build" in dockerfile
+    for package in ("catalog", "integrations", "threatbridge"):
+        assert f"COPY {package} ./{package}" in dockerfile, package
+
+    validations = [
+        line for line in dockerfile.splitlines() if "catalog, integrations, threatbridge" in line
+    ]
+    assert len(validations) == 1, validations
+    invocation = re.search(
+        r"(?P<safe_path>PYTHONSAFEPATH=\S+\s+)?"
+        r"/opt/runtime-venv/bin/python(?P<flags>(?:\s+-\w+)*)\s+-c\s+'(?P<program>.*)'",
+        validations[0],
+    )
+    assert invocation is not None, validations[0]
+
+    flags = invocation["flags"].split()
+    assert invocation["safe_path"] or {"-P", "-I"} & set(flags), (
+        "The installed-wheel validation must run in safe-path mode, or the build "
+        f"directory shadows the wheel it is meant to prove: {validations[0]}"
+    )
+
+    program = invocation["program"]
+    assert 'sysconfig.get_paths()["purelib"]' in program
+    assert "is_relative_to(site)" in program
+    assert 'importlib.util.find_spec("pip") is None' in program
+
+    # Prove the flag actually has the semantics the Dockerfile relies on, rather than
+    # trusting that it is spelled correctly.
+    shadow = tmp_path / "catalog"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("", encoding="utf-8")
+    probe = "import catalog; print(catalog.__file__)"
+
+    unprotected = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert unprotected.stdout.strip() == str(shadow / "__init__.py")
+
+    protected = subprocess.run(
+        [sys.executable, "-P", "-c", probe],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert str(tmp_path) not in protected.stdout
 
 
 def test_generated_image_evidence_stays_out_of_source_candidate() -> None:

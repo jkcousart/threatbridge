@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import socket
+import ssl
 from urllib.parse import ParseResult, urlparse
 from urllib.request import (
     HTTPHandler,
@@ -20,6 +21,18 @@ class UnsafeOutboundUrlError(ValueError):
     pass
 
 
+# Minimal, stable identification for remote operators. Deliberately omits the patch
+# level, Python version, and host details so requests leak no deployment metadata.
+USER_AGENT = "ThreatBridge/0.3"
+# urllib never negotiates compression, so state it explicitly: a bounded read of an
+# encoded body would otherwise depend on server goodwill.
+BASE_REQUEST_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Encoding": "identity",
+    "User-Agent": USER_AGENT,
+}
+
+
 _DOCUMENTATION_NETWORKS = (
     ipaddress.ip_network("192.0.2.0/24"),
     ipaddress.ip_network("198.51.100.0/24"),
@@ -33,6 +46,27 @@ _METADATA_ADDRESSES = frozenset(
         ipaddress.ip_address("100.100.100.200"),
         ipaddress.ip_address("fd00:ec2::254"),
     }
+)
+# Cloud metadata services are also reachable by name inside many providers. Deny the
+# names outright so an allow-list entry can never resolve one by accident.
+_METADATA_HOSTNAMES = frozenset(
+    {
+        "instance-data",
+        "metadata",
+        "metadata.google.internal",
+        "metadata.goog",
+        "metadata.oraclecloud.com",
+    }
+)
+# Tunnelling and translation prefixes that embed an inner IPv4 address. These can be
+# globally routable while still resolving to an internal destination, so they are never
+# reachable regardless of the private CIDR allow-list.
+_TUNNEL_NETWORKS = (
+    ipaddress.ip_network("192.88.99.0/24"),  # deprecated 6to4 relay anycast
+    ipaddress.ip_network("64:ff9b::/96"),  # NAT64 well-known prefix
+    ipaddress.ip_network("64:ff9b:1::/48"),  # NAT64 local-use prefix
+    ipaddress.ip_network("2002::/16"),  # 6to4
+    ipaddress.ip_network("2001::/32"),  # Teredo
 )
 
 
@@ -78,6 +112,10 @@ def _allowed_private_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6N
 
 def _require_allowed_host(hostname: str) -> str:
     normalized_hostname = _normalized_hostname(hostname)
+    if normalized_hostname in _METADATA_HOSTNAMES or any(
+        normalized_hostname.endswith(f".{name}") for name in _METADATA_HOSTNAMES
+    ):
+        raise UnsafeOutboundUrlError("Outbound URLs must not target a metadata service")
     allowed_hosts = _allowed_hosts()
     if not settings.DEBUG and not allowed_hosts:
         raise UnsafeOutboundUrlError("Production outbound hosts require an explicit allow-list")
@@ -101,7 +139,7 @@ def _is_prohibited_address(address: ipaddress.IPv4Address | ipaddress.IPv6Addres
         or address in _METADATA_ADDRESSES
         or any(
             address.version == network.version and address in network
-            for network in _DOCUMENTATION_NETWORKS
+            for network in (*_DOCUMENTATION_NETWORKS, *_TUNNEL_NETWORKS)
         )
     )
 
@@ -216,6 +254,25 @@ def _url_origin(url: str) -> tuple[str, str, int]:
     return parsed.scheme, hostname, port
 
 
+def connect_timeout_seconds(read_timeout: float | None) -> float | None:
+    """Return the TCP connect budget, which is capped below the read timeout."""
+
+    configured = getattr(settings, "THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT", 10)
+    try:
+        connect_timeout = float(configured)
+    except (TypeError, ValueError) as exc:
+        raise UnsafeOutboundUrlError(
+            "THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT must be a positive number"
+        ) from exc
+    if connect_timeout <= 0:
+        raise UnsafeOutboundUrlError(
+            "THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT must be a positive number"
+        )
+    if read_timeout is None:
+        return connect_timeout
+    return min(connect_timeout, read_timeout)
+
+
 def _create_allowed_connection(
     address: tuple[str, int],
     timeout: object = socket._GLOBAL_DEFAULT_TIMEOUT,
@@ -223,15 +280,19 @@ def _create_allowed_connection(
 ):
     hostname, port = address
     addresses = _resolved_allowed_addresses(hostname, port)
+    read_timeout = timeout if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT else None
+    connect_timeout = connect_timeout_seconds(read_timeout)
     last_error: OSError | None = None
     for family, socktype, proto, _canonname, sockaddr in addresses:
         connection = socket.socket(family, socktype, proto)
         try:
-            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
-                connection.settimeout(timeout)
+            connection.settimeout(connect_timeout)
             if source_address:
                 connection.bind(source_address)
             connection.connect(sockaddr)
+            # Separate budgets: the connect phase is bounded above, and the remaining
+            # time is granted to individual reads.
+            connection.settimeout(read_timeout)
             return connection
         except OSError as exc:
             last_error = exc
@@ -253,6 +314,16 @@ class _PinnedHttpsConnection(http.client.HTTPSConnection):
         self._create_connection = _create_allowed_connection
 
 
+
+
+def _build_tls_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    extra_ca_file = getattr(settings, "THREATBRIDGE_EXTRA_CA_FILE", None)
+    if extra_ca_file:
+        context.load_verify_locations(cafile=extra_ca_file)
+    return context
+
+
 class _PinnedHttpHandler(HTTPHandler):
     def http_open(self, request):
         return self.do_open(_PinnedHttpConnection, request)
@@ -263,7 +334,14 @@ class _PinnedHttpsHandler(HTTPSHandler):
         return self.do_open(_PinnedHttpsConnection, request, context=self._context)
 
 
+MAX_REDIRECTS = 3
+
+
 class _ValidatedRedirectHandler(HTTPRedirectHandler):
+    # urllib's default allows 10 hops and has varied across releases; pin it so the
+    # ceiling is part of the reviewed policy rather than inherited behaviour.
+    max_redirections = MAX_REDIRECTS
+
     def redirect_request(self, request, fp, code, message, headers, new_url):
         if _url_origin(request.full_url) != _url_origin(new_url):
             raise UnsafeOutboundUrlError("Cross-origin outbound redirects are not allowed")
@@ -276,7 +354,7 @@ def open_outbound_request(request: Request, *, timeout: int):
     opener = build_opener(
         ProxyHandler({}),
         _PinnedHttpHandler(),
-        _PinnedHttpsHandler(),
+        _PinnedHttpsHandler(context=_build_tls_context()),
         _ValidatedRedirectHandler(),
     )
     return opener.open(request, timeout=timeout)

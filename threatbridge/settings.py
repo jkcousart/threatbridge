@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import stat
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -12,6 +13,69 @@ from django.core.exceptions import ImproperlyConfigured
 from threatbridge.startup_audit import record_production_configuration_failure
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _configured_value(name: str) -> str | None:
+    direct_value = os.getenv(name)
+    file_name = os.getenv(f"{name}_FILE")
+    if direct_value and file_name:
+        raise ImproperlyConfigured(
+            f"Set only one of {name} or {name}_FILE"
+        )
+    if direct_value:
+        return direct_value
+    if not file_name:
+        return None
+
+    path = Path(file_name)
+    if not path.is_absolute():
+        raise ImproperlyConfigured(f"{name}_FILE must be an absolute path")
+    try:
+        if path.is_symlink():
+            raise ImproperlyConfigured(f"{name}_FILE must not be a symlink")
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ImproperlyConfigured(f"{name}_FILE must be a regular file")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ImproperlyConfigured(
+                f"{name}_FILE must not be group- or world-writable"
+            )
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ImproperlyConfigured(f"Unable to read {name}_FILE") from exc
+    if not value:
+        raise ImproperlyConfigured(f"{name}_FILE must not be empty")
+    return value
+
+
+
+
+def _configured_file_path(name: str) -> str | None:
+    file_name = os.getenv(name)
+    if not file_name:
+        return None
+    path = Path(file_name)
+    if not path.is_absolute():
+        raise ImproperlyConfigured(f"{name} must be an absolute path")
+    try:
+        if path.is_symlink():
+            raise ImproperlyConfigured(f"{name} must not be a symlink")
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ImproperlyConfigured(f"{name} must be a regular file")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ImproperlyConfigured(
+                f"{name} must not be group- or world-writable"
+            )
+        # stat succeeds on a file this process cannot read, and a mounted file often
+        # carries the host owner's mode rather than the container user's. Read it here so
+        # an unreadable trust anchor or secret fails at startup instead of silently
+        # degrading later, when the only symptom is a failed outbound connection.
+        with path.open("rb") as handle:
+            handle.read(1)
+    except OSError as exc:
+        raise ImproperlyConfigured(f"Unable to read {name}") from exc
+    return str(path)
 
 
 def _environment_boolean(name: str, default: bool = False) -> bool:
@@ -48,8 +112,60 @@ def _development_secret(path: Path) -> str:
     return secret
 
 
+MINIMUM_SECRET_KEY_LENGTH = 50
+MINIMUM_SECRET_KEY_DISTINCT_CHARACTERS = 16
+_PLACEHOLDER_SECRET_MARKERS = (
+    "changeme",
+    "change-me",
+    "change_me",
+    "django-insecure",
+    "example",
+    "insecure",
+    "placeholder",
+    "replace",
+    "sample",
+    "synthetic",
+    "test-secret",
+    "todo",
+    "xxxx",
+    "your-secret",
+    "yoursecret",
+)
+
+
+def _validate_secret_key_strength(secret: str) -> None:
+    """Reject placeholder or low-entropy production secrets.
+
+    This is a coarse fail-closed gate, not an entropy measurement. It exists so a
+    copied example value cannot silently become a production signing key.
+    """
+
+    if len(secret) < MINIMUM_SECRET_KEY_LENGTH:
+        record_production_configuration_failure("DJANGO_SECRET_KEY")
+        raise ImproperlyConfigured(
+            "DJANGO_SECRET_KEY must be at least "
+            f"{MINIMUM_SECRET_KEY_LENGTH} characters in production"
+        )
+    folded = secret.casefold()
+    for marker in _PLACEHOLDER_SECRET_MARKERS:
+        if marker in folded:
+            record_production_configuration_failure("DJANGO_SECRET_KEY")
+            raise ImproperlyConfigured(
+                "DJANGO_SECRET_KEY looks like a placeholder value; generate a unique "
+                "secret with scripts/prepare_production_deployment.py"
+            )
+    if len(set(secret)) < MINIMUM_SECRET_KEY_DISTINCT_CHARACTERS:
+        record_production_configuration_failure("DJANGO_SECRET_KEY")
+        raise ImproperlyConfigured(
+            "DJANGO_SECRET_KEY must contain at least "
+            f"{MINIMUM_SECRET_KEY_DISTINCT_CHARACTERS} distinct characters"
+        )
+
+
 def _secret_key(*, debug: bool, configured_secret: str | None, local_path: Path) -> str:
     if configured_secret:
+        if not debug:
+            _validate_secret_key_strength(configured_secret)
         return configured_secret
     if not debug:
         record_production_configuration_failure("DJANGO_SECRET_KEY")
@@ -59,7 +175,7 @@ def _secret_key(*, debug: bool, configured_secret: str | None, local_path: Path)
 
 SECRET_KEY = _secret_key(
     debug=DEBUG,
-    configured_secret=os.getenv("DJANGO_SECRET_KEY"),
+    configured_secret=_configured_value("DJANGO_SECRET_KEY"),
     local_path=BASE_DIR / ".secrets" / "django-secret-key",
 )
 
@@ -74,7 +190,7 @@ CSRF_TRUSTED_ORIGINS = [
     if value.strip()
 ]
 
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'db.sqlite3'}")
+DATABASE_URL = _configured_value("DATABASE_URL") or f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
 
 
 def _is_exact_https_origin(value: str) -> bool:
@@ -146,7 +262,7 @@ def _validate_production_configuration() -> None:
         raise ImproperlyConfigured(
             "DJANGO_CSRF_TRUSTED_ORIGINS must contain explicit HTTPS origins in production"
         )
-    configured_database = os.getenv("DATABASE_URL")
+    configured_database = _configured_value("DATABASE_URL")
     database_url = urlsplit(configured_database or "")
     if (
         not configured_database
@@ -177,13 +293,32 @@ def _validate_production_configuration() -> None:
             "DJANGO_SECURE_HSTS_SECONDS must be explicitly configured in production"
         )
     try:
-        if int(hsts_value) < 0:
+        hsts_seconds = int(hsts_value)
+        if hsts_seconds < 0:
             raise ValueError
     except ValueError as exc:
         record_production_configuration_failure("DJANGO_SECURE_HSTS_SECONDS")
         raise ImproperlyConfigured(
             "DJANGO_SECURE_HSTS_SECONDS must be a non-negative integer"
         ) from exc
+    if _environment_boolean("DJANGO_SECURE_HSTS_PRELOAD", False) and (
+        hsts_seconds < 31_536_000
+        or not _environment_boolean("DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS", False)
+    ):
+        record_production_configuration_failure("DJANGO_SECURE_HSTS_PRELOAD")
+        raise ImproperlyConfigured(
+            "DJANGO_SECURE_HSTS_PRELOAD requires DJANGO_SECURE_HSTS_SECONDS of at least "
+            "31536000 and DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS=true; complete the "
+            "staged HSTS rollout in docs/deployment-hardening.md first"
+        )
+    if _environment_boolean("DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS", False) and (
+        hsts_seconds == 0
+    ):
+        record_production_configuration_failure("DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS")
+        raise ImproperlyConfigured(
+            "DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS has no effect while "
+            "DJANGO_SECURE_HSTS_SECONDS is 0"
+        )
 
 
 _validate_production_configuration()
@@ -271,6 +406,14 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 100,
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": os.getenv("THREATBRIDGE_ANON_THROTTLE_RATE", "30/minute"),
+        "user": os.getenv("THREATBRIDGE_USER_THROTTLE_RATE", "600/minute"),
+    },
 }
 
 THREATBRIDGE_DATA_DIR = Path(os.getenv("THREATBRIDGE_DATA_DIR", BASE_DIR / "data"))
@@ -292,10 +435,15 @@ THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS = tuple(
     for value in os.getenv("THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS", "").split(",")
     if value.strip()
 )
+THREATBRIDGE_EXTRA_CA_FILE = _configured_file_path("THREATBRIDGE_EXTRA_CA_FILE")
 
 X_FRAME_OPTIONS = "DENY"
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin"
+# Host and port are never taken from forwarded headers; ALLOWED_HOSTS is authoritative.
+USE_X_FORWARDED_HOST = False
+USE_X_FORWARDED_PORT = False
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
@@ -310,6 +458,11 @@ if not DEBUG:
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SECURE_SSL_REDIRECT = True
+    # The container health check probes loopback over plain HTTP and cannot follow a
+    # redirect to the public hostname. Both endpoints return a fixed status string and no
+    # configuration detail, so exempting only these two paths keeps the redirect in force
+    # everywhere that carries data.
+    SECURE_REDIRECT_EXEMPT = [r"^healthz$", r"^readyz$"]
     if _environment_boolean("DJANGO_TRUST_X_FORWARDED_PROTO", False):
         SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
@@ -324,6 +477,9 @@ THREATBRIDGE_MAX_IMPORT_RECORDS = int(
 )
 THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES = int(
     os.getenv("THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES", str(10 * 1024 * 1024))
+)
+THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT = float(
+    os.getenv("THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT", "10")
 )
 THREATBRIDGE_MAX_JSON_DEPTH = int(os.getenv("THREATBRIDGE_MAX_JSON_DEPTH", "20"))
 THREATBRIDGE_MAX_OBJECT_FIELDS = int(
@@ -348,6 +504,59 @@ THREATBRIDGE_MAX_PREVIEW_SAMPLES = int(
 THREATBRIDGE_MAX_IMPORT_ERRORS = int(
     os.getenv("THREATBRIDGE_MAX_IMPORT_ERRORS", "100")
 )
+
+# Bound the request body Django itself will buffer before the import layer sees it, so
+# an oversized upload is rejected by the framework instead of consuming worker memory.
+DATA_UPLOAD_MAX_MEMORY_SIZE = THREATBRIDGE_MAX_UPLOAD_BYTES + 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = min(THREATBRIDGE_MAX_UPLOAD_BYTES, 2 * 1024 * 1024)
+DATA_UPLOAD_MAX_NUMBER_FIELDS = int(
+    os.getenv("THREATBRIDGE_MAX_REQUEST_FIELDS", "200")
+)
+DATA_UPLOAD_MAX_NUMBER_FILES = int(os.getenv("THREATBRIDGE_MAX_REQUEST_FILES", "10"))
+FILE_UPLOAD_PERMISSIONS = 0o600
+FILE_UPLOAD_DIRECTORY_PERMISSIONS = 0o700
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "filters": {
+        "redact_sensitive_data": {
+            "()": "threatbridge.log_redaction.SensitiveDataFilter",
+        },
+    },
+    "formatters": {
+        "threatbridge": {
+            "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "filters": ["redact_sensitive_data"],
+            "formatter": "threatbridge",
+        },
+    },
+    "root": {"handlers": ["console"], "level": os.getenv("DJANGO_LOG_LEVEL", "INFO")},
+    "loggers": {
+        # Gunicorn installs its own handlers before Django configures logging; naming
+        # these loggers explicitly replaces them so access lines are redacted too.
+        "gunicorn.access": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "gunicorn.error": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "django.request": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
+}
 
 for private_cidr in THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS:
     try:

@@ -1,5 +1,33 @@
 # ThreatBridge release-candidate validation
 
+> **Status: point-in-time evidence, superseded in part.** This document records the 0.3.0
+> release-candidate validation run performed on 2026-07-19, before the public-release hardening
+> audit. It is retained as historical evidence and is deliberately not rewritten. Two classes of
+> statement here no longer describe the current tree:
+>
+> - **Runtime user and interpreter paths.** The runtime image now runs as numeric UID/GID
+>   `65532:65532` with no named account, and the application resolves from a runtime-only virtual
+>   environment under `/opt/runtime-venv`, not `/usr/local/lib/python3.13/site-packages`. The
+>   observations below are superseded; `scripts/validate_container_image.sh` asserts the current
+>   contract.
+> - **Scan counts and image identity.** The image ID, SBOM digests, report digests, and
+>   critical/high counts below belong to that build and that scanner database. They are not evidence
+>   about any later build. Prebuilt-image publication remains blocked under the policy in
+>   [`container-image-security.md`](container-image-security.md) until a fresh unsuppressed scan of a
+>   fresh image ID is reviewed.
+> - **Base image.** This run used the Debian `python:3.13.14-slim` base. The default is now
+>   `python:3.13.14-alpine3.24`, pinned by digest, so every Debian package name, package count, and
+>   operating-system observation below describes a base ThreatBridge no longer builds on by default.
+>   The base comparison that led to that change, including the Debian and Bookworm results, is
+>   recorded in [`container-image-security.md`](container-image-security.md) and
+>   [`security/public-release-hardening-audit.md`](security/public-release-hardening-audit.md).
+>
+> Controls added after this run — weak-secret rejection, the explicit `DJANGO_DEBUG` requirement at
+> the WSGI/ASGI entry points, log redaction, API throttling, request and upload limits, the
+> `deploy-check` gate, per-service resource and PID limits, the expanded SSRF denylist, and separate
+> connect and read timeouts — are validated in
+> [`security/public-release-hardening-audit.md`](security/public-release-hardening-audit.md), not here.
+
 Validated locally on 2026-07-19 (America/Edmonton) with Python 3.14.4 on the host and Python
 3.13.14 in the container. Both environments resolved Django 6.0.7 and Django REST Framework
 3.17.1. The supported source range remains `Django>=5.2,<7`.
@@ -150,6 +178,32 @@ migrations to disposable databases, imported all application packages from site-
 passed identical ownership and permissions inspection. Bookworm did not materially reduce the
 blocking findings; it increased the critical and total counts and was larger. The reviewed current
 slim digest was therefore retained.
+
+## Superseded by the production Compose integration gate
+
+Everything above was assembled by hand. That is precisely why it is no longer the release
+evidence of record: the Docker validation in this document proved the *image* worked, and
+six defects in the *deployment* still reached a committed state afterwards, because no
+step here ever started the production stack.
+
+The authoritative gate is now a single script:
+
+```bash
+bash scripts/validate_production_compose.sh
+```
+
+It performs the image validation, SBOM generation, and unsuppressed scan recorded above,
+and then does what this run did not: renders the production Compose project, starts the
+complete stack on a disposable loopback-only deployment, and asserts the live runtime
+contract, HTTP behaviour, network isolation, and private-CA handling. It is a mandatory
+release gate, and it runs in CI on every pull request and every push to `main` as the
+**Validate the production Compose stack** check in
+`.github/workflows/compose-integration.yml`.
+
+Its output has the same point-in-time limits as the evidence above. A clean run describes
+one commit, one image ID, and one scanner database; it is not evidence about a later build.
+The release commit itself must pass the gate before a tag or image is published, and CI
+builds and exercises the stack without ever publishing it.
 
 ## Remaining release boundaries
 

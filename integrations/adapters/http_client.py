@@ -9,7 +9,11 @@ from urllib.parse import urlencode
 from urllib.request import Request
 
 from integrations.http_response import ResponseTooLargeError, read_bounded_response
-from integrations.outbound import UnsafeOutboundUrlError, open_outbound_request
+from integrations.outbound import (
+    BASE_REQUEST_HEADERS,
+    UnsafeOutboundUrlError,
+    open_outbound_request,
+)
 
 
 class HttpClientError(RuntimeError):
@@ -26,11 +30,7 @@ def request_json(
     timeout: int = 30,
     retries: int = 3,
 ) -> Mapping[str, Any]:
-    request_headers = {
-        "Accept": "application/json",
-        "User-Agent": "ThreatBridge/0.2",
-        **dict(headers or {}),
-    }
+    request_headers = {**BASE_REQUEST_HEADERS, **dict(headers or {})}
     body: bytes | None = None
     if json_body is not None:
         body = json.dumps(json_body).encode("utf-8")

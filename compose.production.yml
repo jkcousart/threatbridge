@@ -1,0 +1,227 @@
+name: threatbridge
+
+# Anchored so each PID ceiling is written once and cannot drift between the two keys that
+# have to agree.
+x-app-pids-limit: &app-pids-limit 256
+x-db-pids-limit: &db-pids-limit 512
+
+x-app-environment: &app-environment
+  DJANGO_DEBUG: "false"
+  DJANGO_SECRET_KEY_FILE: /run/secrets/django_secret_key
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?Set DJANGO_ALLOWED_HOSTS in deploy/.env.production}
+  DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:?Set DJANGO_CSRF_TRUSTED_ORIGINS in deploy/.env.production}
+  DJANGO_SECURE_HSTS_SECONDS: ${DJANGO_SECURE_HSTS_SECONDS:?Set DJANGO_SECURE_HSTS_SECONDS in deploy/.env.production}
+  DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: ${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}
+  DJANGO_SECURE_HSTS_PRELOAD: ${DJANGO_SECURE_HSTS_PRELOAD:-false}
+  # Defaults to false. Enable only when a reverse proxy terminates TLS *and*
+  # unconditionally overwrites X-Forwarded-Proto, and the published container port is
+  # unreachable by clients. See docs/deployment-hardening.md.
+  DJANGO_TRUST_X_FORWARDED_PROTO: ${THREATBRIDGE_TRUST_X_FORWARDED_PROTO:-false}
+  DJANGO_TIME_ZONE: ${DJANGO_TIME_ZONE:-America/Edmonton}
+  DATABASE_URL_FILE: /run/secrets/database_url
+  THREATBRIDGE_DATA_DIR: /app/data
+  THREATBRIDGE_ALLOWED_ADAPTER_PREFIXES: integrations.adapters.
+  THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS: ${THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS:?Set the exact outbound host allowlist}
+  THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS: ${THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS:-}
+  THREATBRIDGE_MAX_PAGES_PER_SYNC: ${THREATBRIDGE_MAX_PAGES_PER_SYNC:-50}
+  THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES: ${THREATBRIDGE_MAX_HTTP_RESPONSE_BYTES:-10485760}
+  THREATBRIDGE_MAX_UPLOAD_BYTES: ${THREATBRIDGE_MAX_UPLOAD_BYTES:-52428800}
+  THREATBRIDGE_MAX_IMPORT_RECORDS: ${THREATBRIDGE_MAX_IMPORT_RECORDS:-100000}
+  THREATBRIDGE_MAX_JSON_DEPTH: ${THREATBRIDGE_MAX_JSON_DEPTH:-20}
+  THREATBRIDGE_MAX_OBJECT_FIELDS: ${THREATBRIDGE_MAX_OBJECT_FIELDS:-500}
+  THREATBRIDGE_MAX_FIELD_NAME_LENGTH: ${THREATBRIDGE_MAX_FIELD_NAME_LENGTH:-200}
+  THREATBRIDGE_MAX_SCALAR_LENGTH: ${THREATBRIDGE_MAX_SCALAR_LENGTH:-100000}
+  THREATBRIDGE_MAX_CSV_COLUMNS: ${THREATBRIDGE_MAX_CSV_COLUMNS:-500}
+  THREATBRIDGE_MAX_CSV_FIELD_LENGTH: ${THREATBRIDGE_MAX_CSV_FIELD_LENGTH:-100000}
+  THREATBRIDGE_MAX_JSONL_LINE_BYTES: ${THREATBRIDGE_MAX_JSONL_LINE_BYTES:-1048576}
+  THREATBRIDGE_MAX_PREVIEW_SAMPLES: ${THREATBRIDGE_MAX_PREVIEW_SAMPLES:-5}
+  THREATBRIDGE_MAX_IMPORT_ERRORS: ${THREATBRIDGE_MAX_IMPORT_ERRORS:-100}
+  THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT: ${THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT:-10}
+  THREATBRIDGE_ANON_THROTTLE_RATE: ${THREATBRIDGE_ANON_THROTTLE_RATE:-30/minute}
+  THREATBRIDGE_USER_THROTTLE_RATE: ${THREATBRIDGE_USER_THROTTLE_RATE:-600/minute}
+
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    PYTHON_BUILDER_IMAGE: ${THREATBRIDGE_PYTHON_BUILDER_IMAGE:?Resolve and pin the builder image}
+    PYTHON_RUNTIME_IMAGE: ${THREATBRIDGE_PYTHON_RUNTIME_IMAGE:?Resolve and pin the runtime image}
+
+x-app-security: &app-security
+  user: "65532:65532"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    # The only writable path outside the named data volume. Gunicorn needs it for worker
+    # heartbeat files; nothing there is ever executed.
+    - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+  # Declared in both places with one anchored value. Compose rejects a project that sets
+  # pids_limit alongside deploy.resources.limits without a matching pids entry, and older
+  # Compose releases ignore deploy outside swarm, so keeping both is what guarantees the
+  # limit is actually applied.
+  pids_limit: *app-pids-limit
+  # PID 1 reaping for any short-lived child processes under a read-only root.
+  init: true
+  deploy:
+    resources:
+      limits:
+        cpus: ${THREATBRIDGE_APP_CPU_LIMIT:-2.0}
+        memory: ${THREATBRIDGE_APP_MEMORY_LIMIT:-1g}
+        pids: *app-pids-limit
+      reservations:
+        memory: ${THREATBRIDGE_APP_MEMORY_RESERVATION:-256m}
+
+x-app-secrets: &app-secrets
+  - django_secret_key
+  - database_url
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  db:
+    image: ${THREATBRIDGE_POSTGRES_IMAGE:?Resolve and pin the PostgreSQL image}
+    environment:
+      POSTGRES_DB: threatbridge
+      POSTGRES_USER: threatbridge
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - threatbridge-db:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threatbridge -d threatbridge"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 60s
+    shm_size: 128m
+    # The official PostgreSQL entrypoint starts as root and drops to the postgres user,
+    # so it needs a writable root and the capabilities to change ownership. Privilege
+    # escalation is still blocked and the container is never exposed outside the
+    # internal database network. See docs/deployment-hardening.md for the residual risk.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: *db-pids-limit
+    init: true
+    deploy:
+      resources:
+        limits:
+          cpus: ${THREATBRIDGE_DB_CPU_LIMIT:-2.0}
+          memory: ${THREATBRIDGE_DB_MEMORY_LIMIT:-1g}
+          pids: *db-pids-limit
+        reservations:
+          memory: ${THREATBRIDGE_DB_MEMORY_RESERVATION:-256m}
+    logging: *default-logging
+
+  # Runs Django's deployment checks before anything touches the database or serves
+  # traffic, so a misconfigured production environment fails closed at startup.
+  deploy-check:
+    image: ${THREATBRIDGE_IMAGE:-threatbridge:local}
+    build: *app-build
+    command: ["python", "manage.py", "check", "--deploy", "--fail-level", "ERROR"]
+    environment: *app-environment
+    secrets: *app-secrets
+    # Reads configuration only. Declaring no networks would attach it to the implicit
+    # default bridge and give the gate outbound access it never uses.
+    network_mode: none
+    restart: "no"
+    <<: *app-security
+    logging: *default-logging
+
+  migrate:
+    image: ${THREATBRIDGE_IMAGE:-threatbridge:local}
+    build: *app-build
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    environment: *app-environment
+    secrets: *app-secrets
+    networks:
+      - database
+    depends_on:
+      db:
+        condition: service_healthy
+      deploy-check:
+        condition: service_completed_successfully
+    restart: "no"
+    <<: *app-security
+    logging: *default-logging
+
+  web:
+    image: ${THREATBRIDGE_IMAGE:-threatbridge:local}
+    build: *app-build
+    command:
+      - gunicorn
+      - threatbridge.wsgi:application
+      - --bind
+      - 0.0.0.0:8000
+      - --workers
+      - ${THREATBRIDGE_GUNICORN_WORKERS:-3}
+      - --threads
+      - ${THREATBRIDGE_GUNICORN_THREADS:-2}
+      - --timeout
+      - ${THREATBRIDGE_GUNICORN_TIMEOUT:-90}
+      - --access-logfile
+      - "-"
+      - --error-logfile
+      - "-"
+    environment: *app-environment
+    secrets: *app-secrets
+    volumes:
+      - threatbridge-data:/app/data
+    networks:
+      - database
+      - edge
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${THREATBRIDGE_BIND_ADDRESS:?Set the dedicated host LAN address}:${THREATBRIDGE_PORT:-8020}:8000"
+    healthcheck:
+      # No `test` on purpose. Compose inherits the image's HEALTHCHECK command and applies
+      # only the timings below, so the probe is defined once in the Dockerfile and a fix
+      # there cannot be silently overridden here.
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 45s
+    <<: *app-security
+    logging: *default-logging
+
+volumes:
+  threatbridge-db:
+  threatbridge-data:
+
+networks:
+  database:
+    internal: true
+  edge:
+
+secrets:
+  django_secret_key:
+    file: ${THREATBRIDGE_SECRETS_DIR:-./deploy/secrets}/django-secret-key
+  database_url:
+    file: ${THREATBRIDGE_SECRETS_DIR:-./deploy/secrets}/database-url
+  postgres_password:
+    file: ${THREATBRIDGE_SECRETS_DIR:-./deploy/secrets}/postgres-password

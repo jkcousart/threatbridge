@@ -20,6 +20,9 @@ venv
 .env
 .env.*
 .secrets
+deploy/.env.production
+deploy/secrets
+deploy/ca
 
 # Databases and runtime data
 **/*.sqlite3
@@ -40,14 +43,11 @@ venv
 coverage.xml
 htmlcov
 
-# Private security work products; public architecture/deployment docs remain included
+# Private security work products; public architecture/deployment docs remain included.
+# The whole directory is excluded by default, matching .gitignore.
 security-reports
 release-evidence
-docs/security/tmkb*
-docs/security/*audit-report*
-docs/security/*hardening-report*
-docs/security/hardening-phase-1-report.md
-docs/security/private-*
+docs/security
 
 # Archives and logs
 **/*.zip
@@ -55,6 +55,7 @@ docs/security/private-*
 **/*.tar.gz
 **/*.tgz
 **/*.log
+backups
 
 # Packaging metadata and build output
 *.egg-info

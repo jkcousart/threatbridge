@@ -1,73 +1,127 @@
-FROM python:3.13.14-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS builder
+# syntax=docker/dockerfile:1.7
+
+# Alpine 3.24 is the default because the exact candidate below built with the committed
+# hash-locked requirements, passed runtime confinement validation, and produced zero
+# HIGH or CRITICAL findings in the recorded Trivy 0.70.0 scan. That is point-in-time
+# evidence, not a guarantee about future scans. Override either argument to build from a
+# hardened, mirrored, or private base; every control in this file applies either way.
+ARG PYTHON_BUILDER_IMAGE=python:3.13.14-alpine3.24@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+ARG PYTHON_RUNTIME_IMAGE=python:3.13.14-alpine3.24@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+
+FROM ${PYTHON_BUILDER_IMAGE} AS builder
+
+USER 0
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /build
 
+RUN python -m venv --copies /opt/build-venv \
+    && python -m venv --copies /opt/runtime-venv
+
 COPY requirements/build.txt /build/requirements/build.txt
-RUN python -m pip install --no-cache-dir --require-hashes -r requirements/build.txt
+RUN /opt/build-venv/bin/python -m pip install \
+        --require-hashes \
+        -r requirements/build.txt
 
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY threatbridge ./threatbridge
 COPY integrations ./integrations
 COPY catalog ./catalog
-RUN python -m pip wheel \
-        --no-cache-dir \
+RUN /opt/build-venv/bin/python -m pip wheel \
         --no-deps \
         --no-build-isolation \
         --wheel-dir /tmp/wheels \
         .
 
-FROM python:3.13.14-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
+COPY requirements/runtime.txt /build/requirements/runtime.txt
+RUN /opt/runtime-venv/bin/python -m pip install \
+        --require-hashes \
+        -r requirements/runtime.txt \
+    && /opt/runtime-venv/bin/python -m pip install \
+        --no-deps \
+        /tmp/wheels/threatbridge-*.whl \
+    && /opt/runtime-venv/bin/python -m pip check \
+    && rm -rf \
+        /opt/runtime-venv/bin/pip \
+        /opt/runtime-venv/bin/pip3 \
+        /opt/runtime-venv/bin/pip3.* \
+        /opt/runtime-venv/lib/python*/site-packages/pip \
+        /opt/runtime-venv/lib/python*/site-packages/pip-*.dist-info
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+COPY manage.py /runtime/app/manage.py
+COPY LICENSE NOTICE /runtime/app/
+RUN DJANGO_DEBUG=false \
+       DJANGO_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(64))')" \
+       DJANGO_ALLOWED_HOSTS=build.example.invalid \
+       DJANGO_CSRF_TRUSTED_ORIGINS=https://build.example.invalid \
+       DJANGO_SECURE_HSTS_SECONDS=3600 \
+       DJANGO_STATIC_ROOT=/runtime/app/staticfiles \
+       DATABASE_URL=postgresql://build@database.example.invalid/threatbridge \
+       THREATBRIDGE_DATA_DIR=/runtime/app/data \
+       THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=outbound.example.invalid \
+       /opt/runtime-venv/bin/python /runtime/app/manage.py collectstatic --noinput \
+    && mkdir -p /runtime/app/data \
+    && chmod 0755 /runtime/app /runtime/app/staticfiles \
+    && chmod 0755 /runtime/app/manage.py \
+    && chmod 0644 /runtime/app/LICENSE /runtime/app/NOTICE \
+    && chmod 0750 /runtime/app/data \
+    && /opt/runtime-venv/bin/python -P -c 'import importlib.util, pathlib, sysconfig, catalog, integrations, threatbridge; site = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve(); modules = (catalog, integrations, threatbridge); assert all(pathlib.Path(module.__file__).resolve().is_relative_to(site) for module in modules); assert importlib.util.find_spec("pip") is None' \
+    && test ! -e /runtime/app/.secrets \
+    && test ! -e /runtime/app/catalog \
+    && test ! -e /runtime/app/integrations \
+    && test ! -e /runtime/app/threatbridge \
+    && test ! -e /runtime/app/requirements \
+    && test ! -e /runtime/app/scripts \
+    && test ! -e /runtime/app/.github \
+    && test ! -e /runtime/app/build \
+    && test ! -e /runtime/app/data/incoming \
+    && test -z "$(find /runtime/app -mindepth 1 -maxdepth 1 -name '*.egg-info' -print -quit)" \
+    && test -z "$(find /opt/runtime-venv/lib/python*/site-packages/catalog /opt/runtime-venv/lib/python*/site-packages/integrations /opt/runtime-venv/lib/python*/site-packages/threatbridge -type d -name tests -print -quit)" \
+    && test -z "$(find /runtime/app -xdev \( -type f -o -type d \) -perm -0002 -print -quit)"
+
+FROM ${PYTHON_RUNTIME_IMAGE} AS runtime
+
+# Provenance metadata. THREATBRIDGE_REVISION and THREATBRIDGE_CREATED are supplied by
+# the documented build command; they are descriptive labels only and never secrets.
+ARG THREATBRIDGE_VERSION=0.3.0
+ARG THREATBRIDGE_REVISION=unknown
+ARG THREATBRIDGE_CREATED=unknown
+# Re-declare so the globally scoped digest is readable inside this stage.
+ARG PYTHON_RUNTIME_IMAGE
+
+LABEL org.opencontainers.image.title="ThreatBridge" \
+      org.opencontainers.image.description="Threat-informed integration, evidence, and control-correlation platform" \
+      org.opencontainers.image.version="${THREATBRIDGE_VERSION}" \
+      org.opencontainers.image.revision="${THREATBRIDGE_REVISION}" \
+      org.opencontainers.image.created="${THREATBRIDGE_CREATED}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/jkcousart/threatbridge" \
+      org.opencontainers.image.url="https://github.com/jkcousart/threatbridge" \
+      org.opencontainers.image.documentation="https://github.com/jkcousart/threatbridge/blob/main/docs/deployment-hardening.md" \
+      org.opencontainers.image.base.name="${PYTHON_RUNTIME_IMAGE}"
+
+ENV PATH=/opt/runtime-venv/bin:${PATH} \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DJANGO_STATIC_ROOT=/app/staticfiles \
     THREATBRIDGE_DATA_DIR=/app/data
 
 WORKDIR /app
 
-RUN addgroup --system threatbridge \
-    && adduser --system --ingroup threatbridge threatbridge
+COPY --from=builder --chown=65532:65532 /opt/runtime-venv /opt/runtime-venv
+COPY --from=builder --chown=65532:65532 /runtime/app /app
 
-COPY requirements/runtime.txt /tmp/requirements/runtime.txt
-RUN python -m pip install \
-        --no-cache-dir \
-        --require-hashes \
-        -r /tmp/requirements/runtime.txt
-
-COPY --from=builder /tmp/wheels /tmp/wheels
-RUN python -m pip install --no-cache-dir --no-deps /tmp/wheels/threatbridge-*.whl \
-    && rm -rf /tmp/wheels /tmp/requirements
-
-COPY manage.py LICENSE NOTICE /app/
-RUN DJANGO_DEBUG=false \
-       DJANGO_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(64))')" \
-       DJANGO_ALLOWED_HOSTS=build.example.invalid \
-       DJANGO_CSRF_TRUSTED_ORIGINS=https://build.example.invalid \
-       DJANGO_SECURE_HSTS_SECONDS=3600 \
-       DATABASE_URL=postgresql://build@database.example.invalid/threatbridge \
-       THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=outbound.example.invalid \
-       python manage.py collectstatic --noinput \
-    && mkdir -p /app/data \
-    && python -c 'import pathlib, sysconfig, catalog, integrations, threatbridge; site = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve(); modules = (catalog, integrations, threatbridge); assert all(pathlib.Path(module.__file__).resolve().is_relative_to(site) for module in modules)' \
-    && find /app -type d -exec chmod 0755 {} + \
-    && find /app -type f -exec chmod 0644 {} + \
-    && chmod 0755 /app/manage.py \
-    && chown threatbridge:threatbridge /app/data \
-    && chmod 0750 /app/data \
-    && test ! -e /app/.secrets \
-    && test ! -e /app/catalog \
-    && test ! -e /app/integrations \
-    && test ! -e /app/threatbridge \
-    && test ! -e /app/requirements \
-    && test ! -e /app/scripts \
-    && test ! -e /app/.github \
-    && test ! -e /app/build \
-    && test ! -e /app/data/incoming \
-    && test -z "$(find /app -mindepth 1 -maxdepth 1 -name '*.egg-info' -print -quit)" \
-    && test -z "$(find /usr/local/lib/python*/site-packages/catalog /usr/local/lib/python*/site-packages/integrations /usr/local/lib/python*/site-packages/threatbridge -type d -name tests -print -quit)" \
-    && test -z "$(find /app -xdev \( -type f -o -type d \) -perm -0002 -print -quit)"
-
-USER threatbridge
+USER 65532:65532
+ENTRYPOINT []
 EXPOSE 8000
 
-CMD ["gunicorn", "threatbridge.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "90"]
+# The request goes to loopback, but the Host header has to be one that ALLOWED_HOSTS
+# accepts, otherwise Django answers 400 and the container never reports healthy. Sending
+# the first configured host keeps the probe working without widening ALLOWED_HOSTS.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
+    CMD ["python", "-c", "import os, urllib.request; host = os.environ.get('DJANGO_ALLOWED_HOSTS', '').split(',')[0].strip() or '127.0.0.1'; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/readyz', headers={'Host': host}), timeout=3).read()"]
+
+CMD ["gunicorn", "threatbridge.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "90", "--access-logfile", "-", "--error-logfile", "-"]

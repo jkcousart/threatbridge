@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import platform
 import socket
+import tomllib
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -14,10 +17,15 @@ from integrations.http import IntegrationHttpError
 from integrations.http import request_json as integration_request_json
 from integrations.http_response import ResponseTooLargeError, read_bounded_response
 from integrations.outbound import (
+    BASE_REQUEST_HEADERS,
+    MAX_REDIRECTS,
+    USER_AGENT,
     UnsafeOutboundUrlError,
+    _build_tls_context,
     _create_allowed_connection,
     _PinnedHttpsConnection,
     _ValidatedRedirectHandler,
+    connect_timeout_seconds,
     validate_outbound_url,
 )
 from integrations.secrets import redacted_result, validate_safe_cursor
@@ -247,6 +255,19 @@ class OutboundUrlValidationTests(SimpleTestCase):
 
         self.assertIs(result, connection)
         connection.connect.assert_called_once_with((PRIVATE_TEST_ADDRESS, 443))
+
+    @override_settings(THREATBRIDGE_EXTRA_CA_FILE="/run/configs/internal-root-ca.crt")
+    @patch("integrations.outbound.ssl.create_default_context")
+    def test_tls_context_adds_reviewed_internal_ca(self, create_default_context):
+        context = Mock()
+        create_default_context.return_value = context
+
+        result = _build_tls_context()
+
+        self.assertIs(result, context)
+        context.load_verify_locations.assert_called_once_with(
+            cafile="/run/configs/internal-root-ca.crt"
+        )
 
     def test_tls_connection_retains_original_hostname_for_sni(self):
         tls_context = Mock()
@@ -501,6 +522,113 @@ class OutboundUrlValidationTests(SimpleTestCase):
             integration_request_json("file:///etc/passwd")
         with self.assertRaises(HttpClientError):
             adapter_request_json("file:///etc/passwd", retries=0)
+
+    @override_settings(
+        DEBUG=False,
+        THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=(
+            "metadata.google.internal",
+            "metadata",
+            "vm.metadata.google.internal",
+            "metadata.oraclecloud.com",
+            "instance-data",
+        ),
+        THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS=("0.0.0.0/0", "::/0"),
+    )
+    @patch("integrations.outbound.socket.getaddrinfo")
+    def test_metadata_hostnames_are_rejected_even_when_allowlisted(self, getaddrinfo):
+        for hostname in (
+            "metadata.google.internal",
+            "metadata",
+            "vm.metadata.google.internal",
+            "metadata.oraclecloud.com",
+            "instance-data",
+        ):
+            with self.subTest(hostname=hostname):
+                with self.assertRaisesRegex(UnsafeOutboundUrlError, "metadata service"):
+                    validate_outbound_url(f"https://{hostname}/computeMetadata/v1/")
+
+        getaddrinfo.assert_not_called()
+
+    @override_settings(
+        DEBUG=False,
+        THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=(ALLOWED_HOST,),
+        THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS=("0.0.0.0/0", "::/0"),
+    )
+    def test_tunnel_prefixes_that_embed_inner_addresses_are_rejected(self):
+        for address in (
+            "192.88.99.1",  # deprecated 6to4 relay anycast
+            "64:ff9b::7f00:1",  # NAT64 wrapping 127.0.0.1
+            "64:ff9b:1::a14:1",  # NAT64 local-use prefix
+            "2002:7f00:0001::",  # 6to4 wrapping 127.0.0.1
+            "2001::5ef5:79fb",  # Teredo
+        ):
+            with self.subTest(address=address):
+                with patch(
+                    "integrations.outbound.socket.getaddrinfo",
+                    return_value=_address_info(address),
+                ):
+                    with self.assertRaisesRegex(
+                        UnsafeOutboundUrlError, "prohibited address"
+                    ):
+                        validate_outbound_url(f"https://{ALLOWED_HOST}/data")
+
+    def test_redirect_ceiling_is_declared_rather_than_inherited(self):
+        self.assertEqual(_ValidatedRedirectHandler.max_redirections, MAX_REDIRECTS)
+        self.assertLessEqual(MAX_REDIRECTS, 5)
+        self.assertEqual(
+            _ValidatedRedirectHandler().max_redirections,
+            MAX_REDIRECTS,
+        )
+
+    def test_connect_timeout_is_bounded_and_never_exceeds_the_read_timeout(self):
+        with override_settings(THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT=10):
+            self.assertEqual(connect_timeout_seconds(30), 10)
+            self.assertEqual(connect_timeout_seconds(3), 3)
+            self.assertEqual(connect_timeout_seconds(None), 10)
+        for invalid in (0, -1, "not-a-number"):
+            with self.subTest(invalid=invalid):
+                with override_settings(
+                    THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT=invalid
+                ):
+                    with self.assertRaisesRegex(
+                        UnsafeOutboundUrlError, "positive number"
+                    ):
+                        connect_timeout_seconds(30)
+
+    @override_settings(
+        DEBUG=False,
+        THREATBRIDGE_ALLOWED_OUTBOUND_HOSTS=(ALLOWED_HOST,),
+        THREATBRIDGE_ALLOWED_PRIVATE_OUTBOUND_CIDRS=(),
+        THREATBRIDGE_OUTBOUND_CONNECT_TIMEOUT=4,
+    )
+    @patch(
+        "integrations.outbound.socket.getaddrinfo",
+        return_value=_address_info(PUBLIC_TEST_ADDRESS),
+    )
+    def test_connect_and_read_timeouts_are_applied_separately(self, _getaddrinfo):
+        with patch("integrations.outbound.socket.socket") as socket_factory:
+            connection = socket_factory.return_value
+            _create_allowed_connection((ALLOWED_HOST, 443), 30)
+        self.assertEqual(
+            [call.args[0] for call in connection.settimeout.call_args_list],
+            [4, 30],
+        )
+
+    def test_outbound_user_agent_leaks_no_host_or_interpreter_detail(self):
+        self.assertEqual(BASE_REQUEST_HEADERS["User-Agent"], USER_AGENT)
+        self.assertEqual(BASE_REQUEST_HEADERS["Accept-Encoding"], "identity")
+        lowered = USER_AGENT.lower()
+        for leaked in ("python", "urllib", "linux", "docker", platform.node().lower()):
+            if leaked:
+                self.assertNotIn(leaked, lowered)
+
+        pyproject = tomllib.loads(
+            (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        major, minor = pyproject["project"]["version"].split(".")[:2]
+        self.assertEqual(USER_AGENT, f"ThreatBridge/{major}.{minor}")
 
 
 class BoundedHttpResponseTests(SimpleTestCase):
