@@ -138,6 +138,69 @@ def test_development_compose_stays_on_loopback_and_drops_capabilities() -> None:
     assert web["environment"]["DJANGO_DEBUG"] == "true"
 
 
+# The validated Alpine candidate: it built from the committed hash-locked requirements,
+# passed runtime confinement validation, and recorded zero HIGH or CRITICAL Trivy findings.
+# Changing it requires repeating that evidence, so the value is asserted rather than derived.
+DEFAULT_BASE_IMAGE = (
+    "python:3.13.14-alpine3.24@sha256:"
+    "399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0"
+)
+
+
+def test_dockerfile_defaults_to_the_validated_alpine_base() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    for argument in ("PYTHON_BUILDER_IMAGE", "PYTHON_RUNTIME_IMAGE"):
+        assert f"ARG {argument}={DEFAULT_BASE_IMAGE}" in dockerfile, argument
+
+    # Both stages must consume the arguments, so an override reaches the build.
+    assert "FROM ${PYTHON_BUILDER_IMAGE} AS builder" in dockerfile
+    assert "FROM ${PYTHON_RUNTIME_IMAGE} AS runtime" in dockerfile
+
+    # A tag without a digest would let the base drift underneath a reviewed build.
+    for line in dockerfile.splitlines():
+        if line.startswith(("ARG PYTHON_BUILDER_IMAGE=", "ARG PYTHON_RUNTIME_IMAGE=")):
+            assert "@sha256:" in line, line
+
+    # Alpine is a deliberate distribution choice, not a reason to relax the image contract.
+    assert "USER 65532:65532" in dockerfile
+    assert "EXPOSE 8000" in dockerfile
+    # apk would reintroduce the package surface the Alpine base exists to avoid.
+    assert "apk" not in dockerfile
+
+
+def test_production_image_resolution_defaults_to_the_validated_alpine_release() -> None:
+    resolver = (ROOT / "scripts" / "resolve_production_images.sh").read_text(encoding="utf-8")
+    expected_tag = DEFAULT_BASE_IMAGE.split("@", 1)[0]
+    for argument in ("BUILDER", "RUNTIME"):
+        assert f"THREATBRIDGE_{argument}_TAG:-" in resolver, argument
+    assert resolver.count(f":-{expected_tag}}}") == 2, resolver
+
+    # An exact patch level, because docs/supply-chain.md requires a reviewed selection
+    # rather than silent advancement when a deployment is prepared.
+    assert expected_tag.count(".") >= 2
+    # The resolver must still convert whichever tag it is given into an immutable digest.
+    assert "sha256:[0-9a-f]{64}" in resolver
+    assert "Unable to resolve an immutable digest" in resolver
+    # Private and mirrored registries stay reachable through the override variables.
+    assert "docker login" in resolver
+
+
+def test_base_comparison_measures_the_committed_dockerfile_default() -> None:
+    comparison = (ROOT / "scripts" / "compare_base_images.sh").read_text(encoding="utf-8")
+    assert f'current_ref="{DEFAULT_BASE_IMAGE}"' in comparison
+
+    # A blocked or skipped scan must never read as an approval.
+    assert 'if [[ "${scan_policy}" != "pass" ]]; then' in comparison
+    assert "not eligible for publication" in comparison
+    assert "scan_policy=not-run" in comparison
+    assert "exit 1" in comparison
+    # Fewer findings is not the same as secure, and the script must say so.
+    assert "do not read a" in comparison and "lower count as evidence" in comparison
+    # Naming describes what is compared rather than assuming a distribution.
+    assert "build_candidate default" in comparison
+    assert "slim" not in comparison
+
+
 def test_container_image_declares_opencontainers_provenance_labels() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     for label in (
@@ -236,6 +299,41 @@ def test_exposed_port_inspection_rejects_anything_but_the_single_expected_port(
     assert result.returncode == 1
     assert message in result.stderr
     assert "stub reached docker run" not in result.stderr
+
+
+def test_image_validator_still_demands_every_runtime_control() -> None:
+    """Changing the base distribution must not quietly relax the image contract."""
+
+    validator = (ROOT / "scripts" / "validate_container_image.sh").read_text(encoding="utf-8")
+    for requirement in (
+        # Identity and exposure.
+        '"${configured_user}" != "65532:65532"',
+        '"${exposed_ports}" != "8000/tcp"',
+        "os.getuid() != 65532 or os.getgid() != 65532",
+        # The installed wheel is authoritative and pip is gone.
+        "is not imported from the installed wheel",
+        "is outside the runtime virtual environment",
+        "pip must not be present in the runtime environment",
+        "test package present in runtime wheel",
+        # Confinement, proven by running the image under it.
+        "no-new-privileges is not active",
+        "is not empty",
+        "is writable under a read-only root filesystem",
+        "the Docker socket is present inside the container",
+        # Nothing that leaks secrets or ships source into the runtime layer.
+        "Runtime secrets must not persist in the image environment",
+        "forbidden runtime path",
+        "world-writable runtime path",
+        "Missing OCI label",
+    ):
+        assert requirement in validator, requirement
+
+    assert "--read-only" in validator
+    assert "--cap-drop ALL" in validator
+    assert "--security-opt no-new-privileges:true" in validator
+    assert "--user 65532:65532" in validator
+    for capability_set in ("CapEff", "CapPrm", "CapBnd"):
+        assert capability_set in validator, capability_set
 
 
 def test_production_compose_runs_migrations_without_a_shell() -> None:

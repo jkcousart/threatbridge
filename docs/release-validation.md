@@ -15,6 +15,12 @@
 >   about any later build. Prebuilt-image publication remains blocked under the policy in
 >   [`container-image-security.md`](container-image-security.md) until a fresh unsuppressed scan of a
 >   fresh image ID is reviewed.
+> - **Base image.** This run used the Debian `python:3.13.14-slim` base. The default is now
+>   `python:3.13.14-alpine3.24`, pinned by digest, so every Debian package name, package count, and
+>   operating-system observation below describes a base ThreatBridge no longer builds on by default.
+>   The base comparison that led to that change, including the Debian and Bookworm results, is
+>   recorded in [`container-image-security.md`](container-image-security.md) and
+>   [`security/public-release-hardening-audit.md`](security/public-release-hardening-audit.md).
 >
 > Controls added after this run — weak-secret rejection, the explicit `DJANGO_DEBUG` requirement at
 > the WSGI/ASGI entry points, log redaction, API throttling, request and upload limits, the

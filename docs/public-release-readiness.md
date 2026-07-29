@@ -1,18 +1,30 @@
 # Public release readiness
 
 The source candidate completed technical and owner review and is authorized for
-public source publication. Prebuilt container publication remains blocked by
-the unresolved High and Critical findings documented in
-`release-validation.md`.
+public source publication. Source publication and prebuilt-image publication are
+separate release decisions.
+
+Prebuilt container publication is not yet approved. The blocking HIGH and CRITICAL findings recorded
+in `release-validation.md` came from the previous Debian base; the default is now the Alpine 3.24
+candidate that recorded zero HIGH or CRITICAL findings under the reviewed Trivy 0.70.0 policy. Two
+requirements remain before a prebuilt image can be called ready: the image must be rebuilt from the
+committed Dockerfile default and revalidated, SBOM-generated, and rescanned as that exact artifact,
+and the production Compose stack must be exercised end to end against it. Until both are done, the
+Alpine result is evidence about a locally built candidate rather than about a publishable artifact.
 
 ## Release preparation present
 
 - Canonical Apache-2.0 text, notice, package metadata, and contribution references are prepared,
   approved by the project owner.
 - Hashed build, runtime, and development locks are generated from `pyproject.toml`.
-- The exact Python 3.13.14 slim Docker base is pinned to an immutable manifest digest. The production
-  Compose profile resolves publicly pullable base tags to digests by default, so a third party can
-  reproduce the documented deployment without a private registry subscription.
+- The exact Python 3.13.14 Alpine 3.24 Docker base is pinned to an immutable manifest digest. It was
+  selected on recorded evidence: that candidate built from the committed hash-locked requirements,
+  passed complete container validation, and produced zero HIGH or CRITICAL Trivy 0.70.0 findings,
+  where the Debian `slim` and `slim-bookworm` candidates built and validated but had 23 and 24
+  blocking findings. This is point-in-time evidence, not a durable guarantee. The production Compose
+  profile resolves publicly pullable base tags to digests by default, so a third party can reproduce
+  the documented deployment without a private registry subscription, and hardened or private
+  registries remain available as overrides.
 - GitHub test/security, CodeQL, dependency-review, lock-freshness, container-scan, and SBOM workflows
   use verified full action SHAs, minimal permissions, explicit timeouts, and concurrency controls, and
   no workflow consumes a secret or uses `pull_request_target`.
@@ -58,6 +70,11 @@ the unresolved High and Critical findings documented in
 - The bundled database volume has no replication, point-in-time recovery, or automated backup
   schedule.
 - No release signing or provenance attestation exists yet.
+- The default base's clean scan is point-in-time. Operating-system packages acquire advisories over
+  time, so the image must be rebuilt and rescanned rather than assumed clean, and ThreatBridge is
+  neither certified nor claimed to be free of vulnerabilities.
+- Alpine uses musl libc. Compatibility was validated for the current locked runtime dependency set;
+  adding or upgrading a dependency with compiled artifacts is also a base-compatibility change.
 
 The full list, with the split between what the repository enforces and what the Docker host
 administrator must enforce, is in [`deployment-hardening.md`](deployment-hardening.md). The most

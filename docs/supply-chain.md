@@ -8,35 +8,44 @@ publish signed artifacts or provenance attestations.
 Both Docker stages use the readable exact tag and immutable multi-platform manifest digest:
 
 ```text
-python:3.13.14-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
+python:3.13.14-alpine3.24@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
 ```
 
 To update it:
 
-1. Select an exact Python patch tag; never use `latest`, `3`, or a floating major/minor tag.
-2. Resolve it with `docker buildx imagetools inspect docker.io/library/python:VERSION-slim`.
+1. Select an exact Python patch tag and an exact Alpine release; never use `latest`, `3`, or a
+   floating major/minor tag.
+2. Resolve it with `docker buildx imagetools inspect docker.io/library/python:VERSION-alpineRELEASE`.
 3. Record the top-level manifest-list digest, not an architecture-specific attestation manifest.
 4. Update both `FROM` lines together, preserving the readable tag beside the digest.
 5. Build with `--no-cache`, inspect the resulting base and runtime Python version, and repeat the
    filesystem, secret, ownership, migration, and synthetic production checks.
+6. Rerun the test suite, `scripts/validate_container_image.sh`, `scripts/generate_image_sbom.sh`, and
+   `scripts/scan_container_image.sh` against the exact new image, and update
+   `scripts/compare_base_images.sh` and the tests that pin the default.
 
-The digest was resolved from the Docker Official Image on 2026-07-19. A release reviewer must
-independently resolve it again and review upstream provenance before publication.
+A release reviewer must independently resolve the digest again and review upstream provenance before
+publication.
 
-A bounded comparison against the official immutable
+Alpine 3.24 is the default because that exact candidate built from the committed hash-locked
+requirements, passed complete container validation, and recorded zero HIGH or CRITICAL findings under
+the unsuppressed Trivy 0.70.0 policy. `python:3.13.14-slim` (23 blocking findings) and
 `python:3.13.14-slim-bookworm@sha256:9d7f287598e1a5a978c015ee176d8216435aaf335ed69ac3c38dd1bbb10e8d64`
-base retained the current slim image. Both candidates passed identical startup, Django, migration,
-installed-wheel import, ownership, and permissions checks. The current slim result was smaller,
-contained fewer operating-system packages, and had fewer Trivy critical/high findings. Exact
-comparison evidence is regenerated under the ignored `release-evidence/` directory.
+(24 blocking findings) both built and validated successfully but were rejected by that policy. The
+result is point-in-time evidence about specific image IDs and one scanner database, not a claim that
+Alpine is inherently secure or will stay clean. Rationale, the musl compatibility scope, and the
+upgrade procedure are in [`container-image-security.md`](container-image-security.md).
+
+Exact comparison evidence is regenerated under the ignored `release-evidence/` directory.
 `scripts/compare_base_images.sh` exits non-zero unless every candidate's scan passes, so a blocked
 or skipped comparison cannot be mistaken for an approval.
 
 The production Compose profile resolves its own digests separately from these Dockerfile defaults.
 `scripts/resolve_production_images.sh` defaults both `THREATBRIDGE_BUILDER_TAG` and
-`THREATBRIDGE_RUNTIME_TAG` to the publicly pullable `python:3.13-slim`, so any third party can
-reproduce the documented deployment without a registry subscription. Override either variable to
-build from a hardened, mirrored, or private base; digest pinning and image validation are unchanged.
+`THREATBRIDGE_RUNTIME_TAG` to the publicly pullable `python:3.13.14-alpine3.24`, naming an exact patch
+level so preparation cannot silently advance it, and so any third party can reproduce the documented
+deployment without a registry subscription. Override either variable to build from a hardened,
+mirrored, or private base; digest pinning and image validation are unchanged.
 
 ## Dependency locks
 

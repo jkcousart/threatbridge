@@ -50,12 +50,22 @@ bash scripts/resolve_production_images.sh
 ```
 
 The resolver updates only the three image keys in `deploy/.env.production`. By default it resolves
-publicly pullable Docker Hub images (`python:3.13-slim` for the builder and runtime,
+publicly pullable Docker Hub images (`python:3.13.14-alpine3.24` for the builder and runtime,
 `postgres:17-alpine` for the database), so any third party can complete this step without a
-registry subscription. To build from a hardened, mirrored, or otherwise private base, export
-`THREATBRIDGE_BUILDER_TAG`, `THREATBRIDGE_RUNTIME_TAG`, or `THREATBRIDGE_POSTGRES_TAG` and run
-`docker login` for that registry first. Digest pinning and image validation are identical either
-way.
+registry subscription. The Python default names an exact patch level, matching the Dockerfile's
+committed default, so preparing a deployment never silently advances the base. To build from a
+hardened, mirrored, or otherwise private base, export `THREATBRIDGE_BUILDER_TAG`,
+`THREATBRIDGE_RUNTIME_TAG`, or `THREATBRIDGE_POSTGRES_TAG` and run `docker login` for that registry
+first. Digest pinning and image validation are identical either way.
+
+Alpine 3.24 is the default because that exact candidate built from the committed hash-locked
+requirements, passed complete runtime confinement validation, and recorded zero HIGH or CRITICAL
+findings in the reviewed Trivy 0.70.0 scan. That is point-in-time evidence about one image and one
+scanner database, not a promise that a future scan stays clean, and it is not a claim that
+ThreatBridge is free of vulnerabilities. Debian `slim` and `slim-bookworm` bases were also built and
+validated successfully but had more blocking findings; see
+[`../docs/container-image-security.md`](../docs/container-image-security.md) for the comparison, the
+musl compatibility scope, and the procedure for upgrading the base.
 
 ### Supported secret injection methods
 

@@ -1,7 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
-ARG PYTHON_BUILDER_IMAGE=python:3.13.14-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
-ARG PYTHON_RUNTIME_IMAGE=python:3.13.14-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
+# Alpine 3.24 is the default because the exact candidate below built with the committed
+# hash-locked requirements, passed runtime confinement validation, and produced zero
+# HIGH or CRITICAL findings in the recorded Trivy 0.70.0 scan. That is point-in-time
+# evidence, not a guarantee about future scans. Override either argument to build from a
+# hardened, mirrored, or private base; every control in this file applies either way.
+ARG PYTHON_BUILDER_IMAGE=python:3.13.14-alpine3.24@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+ARG PYTHON_RUNTIME_IMAGE=python:3.13.14-alpine3.24@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
 
 FROM ${PYTHON_BUILDER_IMAGE} AS builder
 

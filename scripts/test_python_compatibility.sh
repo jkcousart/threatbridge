@@ -15,6 +15,10 @@ git ls-files --cached --others --exclude-standard -z \
     | tar --null --files-from=- -cf - \
     | tar -xf - -C "${public_source}"
 
+# These images verify the supported CPython range for a source installation on glibc, which
+# is what development and CI run. They are deliberately not the container base: the runtime
+# image builds on Alpine, and its musl compatibility is proven by the image build and
+# validation in docs/container-image-security.md rather than by this matrix.
 images=(
     "python:3.12.13-slim"
     "python:3.13.14-slim"

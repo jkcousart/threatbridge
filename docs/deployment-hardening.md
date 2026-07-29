@@ -98,8 +98,9 @@ not a production profile; it runs with `DJANGO_DEBUG=true` and a well-known data
 publishes only on `127.0.0.1:8000`. The production profile:
 
 - builds from separately configurable builder and runtime image digests;
-- resolves publicly pullable base images by default (`python:3.13-slim`), with hardened, mirrored,
-  or private registries available through `THREATBRIDGE_BUILDER_TAG` and `THREATBRIDGE_RUNTIME_TAG`;
+- resolves publicly pullable base images by default (`python:3.13.14-alpine3.24`, the validated
+  candidate that recorded zero HIGH or CRITICAL Trivy findings), with hardened, mirrored, or private
+  registries available through `THREATBRIDGE_BUILDER_TAG` and `THREATBRIDGE_RUNTIME_TAG`;
 - runs as numeric UID/GID `65532:65532`;
 - installs and executes the reviewed wheel from a runtime-only virtual environment under
   `/opt/runtime-venv`, without build tooling or `pip`;
@@ -177,9 +178,12 @@ These are known and accepted for the current candidate rather than fixed:
 3. Imported records are validated against shape, size, depth, and count limits and per-type field
    heuristics, not a formal JSON Schema.
 4. The PostgreSQL container retains the five capabilities listed above.
-5. The prebuilt container image is not published. Base-image operating-system packages regularly
-   carry unfixed HIGH or CRITICAL advisories; see
-   [`container-image-security.md`](container-image-security.md) for the finding policy.
+5. The prebuilt container image is not published. Source publication and prebuilt-image publication
+   are separate release decisions. The default Alpine 3.24 base recorded zero HIGH or CRITICAL
+   findings when it was validated, but base-image operating-system packages acquire advisories over
+   time, so that is point-in-time evidence rather than a durable property; see
+   [`container-image-security.md`](container-image-security.md) for the finding policy and the
+   rescanning requirement.
 6. No release signing or provenance attestation exists yet; see [`supply-chain.md`](supply-chain.md).
 7. Docker is a defence-in-depth layer, not an isolation boundary, as stated above.
 

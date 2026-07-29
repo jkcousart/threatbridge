@@ -87,6 +87,15 @@ health checks, log rotation, and backup/restore helpers. It publishes nothing un
 reverse proxy that terminates TLS. See [`deploy/README.md`](deploy/README.md) for the complete
 procedure and [`docs/deployment-hardening.md`](docs/deployment-hardening.md) for the control set.
 
+The default builder and runtime base is the publicly pullable Docker Official Image
+`python:3.13.14-alpine3.24`, pinned by digest. It is the default because that exact candidate built
+from the committed hash-locked requirements, passed runtime confinement validation, and recorded zero
+HIGH or CRITICAL findings in the reviewed Trivy 0.70.0 scan — point-in-time evidence about one image
+and one scanner database, not a promise about future scans. Building from a hardened, mirrored, or
+private base stays supported through `THREATBRIDGE_BUILDER_TAG` and `THREATBRIDGE_RUNTIME_TAG`. See
+[`docs/container-image-security.md`](docs/container-image-security.md) for the base comparison, the
+musl compatibility scope, and the upgrade procedure.
+
 ## Importing CSV and JSON
 
 Users granted `integrations.import_source_file` can open `/imports/new/` and:

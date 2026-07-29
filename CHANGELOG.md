@@ -56,6 +56,9 @@
 - Added a container and filesystem scanning workflow, denied network-copyleft and source-available dependency licences in dependency review, and made base-image comparison exit non-zero unless every candidate scan passes.
 - Ignored private security work products by default in both `.gitignore` and `.dockerignore`, requiring an explicit exception to publish one.
 - Added regression tests for secret strength, HSTS staging, upload limits, throttling, log redaction, entry-point debug enforcement, SSRF metadata and tunnel rejection, timeout separation, authorization denials on every state-changing endpoint, Compose confinement, and workflow failure handling.
+- Adopted `python:3.13.14-alpine3.24`, pinned by digest, as the default builder and runtime base after that exact candidate built from the committed hash-locked requirements, passed complete runtime confinement validation, and recorded zero HIGH or CRITICAL findings under the unsuppressed Trivy 0.70.0 policy, where the Debian `slim` and `slim-bookworm` candidates built and validated but recorded 23 and 24 blocking findings. The result is point-in-time evidence rather than a durable guarantee, musl compatibility is established for the current locked runtime dependency set, and hardened, mirrored, or private base overrides are unchanged.
+- Defaulted production image resolution to the same exact patch-level Alpine tag instead of a floating `python:3.13-slim`, matching the documented requirement to select a reviewed patch level rather than advancing it silently at deployment preparation.
+- Fixed an installed-wheel validation that imported the builder working directory instead of the installed wheel, and an exposed-port inspection that mis-parsed Docker's trailing blank record, without weakening either check.
 
 ## 0.3.0
 

@@ -20,11 +20,13 @@ docker buildx version >/dev/null 2>&1 || {
 }
 
 # Defaults resolve publicly pullable Docker Hub images so any third party can complete
-# the documented production build. Override these to use a hardened or mirrored
-# registry (for example a Docker Hardened Images subscription); the digest pinning and
-# validation below are identical either way.
-builder_tag="${THREATBRIDGE_BUILDER_TAG:-${THREATBRIDGE_DHI_BUILDER_TAG:-python:3.13-slim}}"
-runtime_tag="${THREATBRIDGE_RUNTIME_TAG:-${THREATBRIDGE_DHI_RUNTIME_TAG:-python:3.13-slim}}"
+# the documented production build. They name an exact patch level rather than a floating
+# minor tag, because docs/supply-chain.md requires a reviewed patch selection instead of
+# silent advancement at deployment-preparation time. Override these to use a hardened or
+# mirrored registry (for example a Docker Hardened Images subscription); the digest
+# pinning and validation below are identical either way.
+builder_tag="${THREATBRIDGE_BUILDER_TAG:-${THREATBRIDGE_DHI_BUILDER_TAG:-python:3.13.14-alpine3.24}}"
+runtime_tag="${THREATBRIDGE_RUNTIME_TAG:-${THREATBRIDGE_DHI_RUNTIME_TAG:-python:3.13.14-alpine3.24}}"
 postgres_tag="${THREATBRIDGE_POSTGRES_TAG:-postgres:17-alpine}"
 
 resolve_ref() {

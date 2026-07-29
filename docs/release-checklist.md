@@ -27,7 +27,9 @@ This checklist prepares a release candidate; completing it does not itself autho
 - [ ] Build, runtime, and development locks install with `--require-hashes` in a fresh environment.
 - [ ] `pip check` and `pip-audit --require-hashes --disable-pip -r requirements/runtime.txt`
   pass.
-- [ ] The exact Docker patch tag and immutable digest are independently re-resolved.
+- [ ] The exact Docker patch tag and Alpine release, and their immutable digest, are independently
+      re-resolved and match the Dockerfile default, `scripts/compare_base_images.sh`, and the tests
+      that pin them.
 - [ ] Every workflow action SHA is independently matched to its documented release tag.
 - [ ] Dependabot changes, if any, are independently reviewed; do not claim Dependabot has run when
       it has not.
@@ -54,6 +56,13 @@ This checklist prepares a release candidate; completing it does not itself autho
       image SBOM containing operating-system packages.
 - [ ] Every image high/critical finding is fixed or recorded as a publication blocker; any accepted
       risk requires a separate future process. The MVP candidate does not accept or suppress risk.
+- [ ] The image is rebuilt from the committed Dockerfile default, not from a locally overridden base,
+      and that rebuild is the artifact that was validated, SBOM-generated, and scanned.
+- [ ] A base-image change is accompanied by a fresh build, the full test suite, container validation,
+      image SBOM, and an unsuppressed scan of the new image ID. A previous base's evidence is never
+      carried forward.
+- [ ] The production Compose stack is started end to end against the rebuilt image, with migrations
+      and readiness confirmed, before any prebuilt image is considered publishable.
 - [ ] CodeQL and dependency review have run successfully on the intended public host where
       supported.
 

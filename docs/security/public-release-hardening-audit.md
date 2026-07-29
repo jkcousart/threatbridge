@@ -130,12 +130,90 @@ an extra UDP port on the same number, and an empty port set are all still reject
 deterministically sorted, single-space-joined output in the message. Both tests fail against the old
 pipeline, reproducing the reported `Unexpected exposed ports:  8000/tcp` symptom.
 
-**Live confinement validation remains pending.** The corrected validator has not yet been run to
-completion against the built image, so the runtime confinement assertions — non-root UID, read-only
-root filesystem, empty capability set, `NoNewPrivs=1`, writable `/tmp` only, and no Docker socket —
-together with `scripts/scan_container_image.sh`, are still unobserved. Until
-`scripts/validate_container_image.sh` passes end to end, the Docker runtime controls stay asserted
-rather than observed.
+### Follow-up: confinement validation, scanning, and base-image selection (2026-07-29)
+
+With the port parsing corrected, `scripts/validate_container_image.sh` ran to completion against the
+Debian 13 slim release candidate and **passed in full**. That closes the confinement evidence gap that
+had been open since the audit pass. Observed on the live image:
+
+- effective UID and GID `65532:65532`, and `Config.User` of `65532:65532`;
+- `8000/tcp` as the only exposed port;
+- `catalog`, `integrations`, and `threatbridge` resolving inside `/opt/runtime-venv` site-packages,
+  with no `pip` and no test packages in the runtime wheel;
+- `NoNewPrivs=1` and empty `CapEff`, `CapPrm`, and `CapBnd` under `--cap-drop ALL`;
+- a read-only root filesystem, with `/`, `/app`, `/opt/runtime-venv`, and `/etc` all refusing writes
+  and only `/tmp` writable;
+- no Docker socket inside the container;
+- expected `/app` contents and permissions, no world-writable path, and no source, test, secret, or
+  build material in the runtime layer;
+- the complete OCI label set present.
+
+`scripts/generate_image_sbom.sh` also **succeeded**, producing a CycloneDX image SBOM covering
+operating-system and Python packages for that exact image ID.
+
+`scripts/scan_container_image.sh` then **blocked the candidate**: 23 blocking findings, 4 CRITICAL and
+19 HIGH. That is the finding policy working as intended — it blocks a prebuilt image on any unfixed
+HIGH or CRITICAL regardless of reachability, and no suppression was created.
+
+#### Base-image comparison
+
+Because the application layer was proven clean and the blocking findings were all base-image
+operating-system packages, the comparison moved to the base. Every candidate was built with the same
+committed hash-locked requirements and put through the same complete validation.
+
+| Candidate | Resolved digest | Build | Container validation | Trivy 0.70.0 policy |
+| --- | --- | --- | --- | --- |
+| `python:3.13.14-slim` (Debian 13) | `sha256:6771159c…0e1a91` | Pass | Pass | **Blocked** — 23 findings: 4 CRITICAL, 19 HIGH |
+| `python:3.13.14-slim-bookworm` (Debian 12) | `sha256:9d7f2875…0e8d64` | Pass | Pass | **Blocked** — 24 findings: 6 CRITICAL, 18 HIGH |
+| `python:3.13.14-alpine3.24` | `sha256:399babc8…83f4b0` | Pass | Pass | **Pass** — 0 CRITICAL, 0 HIGH |
+
+The Alpine candidate built from the existing hash-locked requirements with no added `apk` package,
+passed the installed-wheel check, and passed every confinement assertion individually: non-root
+identity, `no-new-privileges`, empty capability sets, read-only root filesystem, and the exact
+exposed-port policy.
+
+#### Selection rationale
+
+`python:3.13.14-alpine3.24@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0` is
+now the committed default builder and runtime base.
+
+It was selected because it is the only evaluated candidate that satisfies the existing finding policy
+on its own evidence. All three candidates built and passed identical runtime validation, so this was
+not a compatibility or functionality decision, and the policy was not relaxed to accommodate any of
+them. The two Debian candidates were rejected because they exceeded a gate that already existed.
+
+Three qualifications are recorded deliberately:
+
+1. **This is point-in-time evidence.** It describes three image IDs against one scanner database on
+   one date. A later scan of the same Alpine digest can report new findings, and nothing here promises
+   otherwise. A lower finding count is not proof that a base is secure.
+2. **musl compatibility was tested for the current locked dependency set only.** `psycopg-binary` is
+   the sole component with compiled artifacts, and it installed and ran under `--require-hashes` on
+   musl in the validated build. Adding or upgrading a dependency with compiled artifacts is therefore
+   also a base-compatibility change. Development and CI remain on glibc.
+3. **Alpine is not distroless.** The runtime layer still has a shell and `apk`. The Dockerfile installs
+   no `apk` package, and the confinement controls are what constrain the runtime, not the absence of
+   tooling.
+
+Hardened, mirrored, and private registry overrides are unchanged and still supported through
+`PYTHON_BUILDER_IMAGE`, `PYTHON_RUNTIME_IMAGE`, `THREATBRIDGE_BUILDER_TAG`, and
+`THREATBRIDGE_RUNTIME_TAG`. `scripts/resolve_production_images.sh` now defaults to the same exact
+patch-level Alpine tag rather than a floating `python:3.13-slim`, which also brings it in line with the
+documented requirement in `docs/supply-chain.md` to select an exact patch tag.
+
+#### What this does not yet establish
+
+The Alpine evidence comes from a locally built comparison candidate, not from the committed default.
+Two things must happen before a prebuilt image can be called ready:
+
+1. **Rebuild from the committed default** — `docker build --no-cache` with no `--build-arg` override —
+   and rerun validation, SBOM generation, and scanning against that exact image ID. Evidence from a
+   comparison build is not evidence about the committed artifact.
+2. **Exercise the production Compose stack end to end** against that image, confirming the
+   `deploy-check` gate, migrations, PostgreSQL connectivity, and readiness.
+
+Generated reports for these runs stay in the ignored `release-evidence/` directory and are not
+committed. Source-repository publication and prebuilt-image publication remain separate decisions.
 
 ## Findings by severity
 
@@ -146,7 +224,7 @@ baseline was already substantially hardened; these are the gaps found and closed
 
 | ID | Finding | Resolution |
 | --- | --- | --- |
-| H-1 | The documented production deployment resolved its base images from a subscription registry, so no third party could follow the documented path. Public users would have improvised an unreviewed base. | `scripts/resolve_production_images.sh` and `deploy/.env.production.example` now default to the publicly pullable `python:3.13-slim`, resolved to a digest. A hardened, mirrored, or private base remains available through `THREATBRIDGE_BUILDER_TAG` and `THREATBRIDGE_RUNTIME_TAG`. |
+| H-1 | The documented production deployment resolved its base images from a subscription registry, so no third party could follow the documented path. Public users would have improvised an unreviewed base. | `scripts/resolve_production_images.sh` and `deploy/.env.production.example` now default to a publicly pullable Docker Official Image, resolved to a digest. The follow-up above settled that default on the exact patch-level `python:3.13.14-alpine3.24`. A hardened, mirrored, or private base remains available through `THREATBRIDGE_BUILDER_TAG` and `THREATBRIDGE_RUNTIME_TAG`. |
 | H-2 | `DJANGO_TRUST_X_FORWARDED_PROTO` was hard-coded to `true` in the production profile. A deployment published without a stripping reverse proxy would treat any attacker-supplied `X-Forwarded-Proto: https` as proof of TLS, satisfying secure-cookie and redirect logic over plaintext. | The value now defaults to `false` and must be opted into. `threatbridge.W002` warns when it is on, and `test_production_compose_does_not_trust_forwarded_proto_by_default` locks the default. |
 | H-3 | `DJANGO_DEBUG` defaults to `true`. A production process that failed to set it would serve with `DEBUG=True`, exposing stack traces and settings. | `threatbridge/runtime.py` requires an explicit `true`/`false`, and `wsgi.py` and `asgi.py` refuse to construct an application without it. Development and `manage.py` are unaffected. |
 | H-4 | `SECRET_KEY` was required in production but unvalidated. A short, repeated, or copy-pasted placeholder key was accepted, undermining session and CSRF signing. | Production keys must be at least 50 characters with at least 16 distinct characters and must not contain any of 15 placeholder markers. |
@@ -280,8 +358,10 @@ pip-audit 2.10.1, Trivy 0.70.0, Gitleaks (build-stamped version string).
 | SBOM regeneration byte-comparison | **Pass** — matches `sbom/threatbridge.cdx.json` |
 | `docker compose config` (both profiles) | **Not run** — no Docker daemon available during the audit pass |
 | Image build | **Pass, after one fix** — the first attempt failed because the builder working directory shadowed the installed wheel and the wheel validation correctly refused it. With `python -P` the image builds on Docker Desktop and the installed-wheel validation passes. See [Follow-up: live build attempt](#follow-up-live-build-attempt-2026-07-29). |
-| `validate_container_image.sh` | **Blocked by a validator bug, now fixed; rerun pending** — the image exposes only `8000/tcp`, but blank-record normalization produced `" 8000/tcp"` and reported a false positive. Parser corrected with the exact-port policy intact. See [Follow-up: live image validation](#follow-up-live-image-validation-2026-07-29). |
-| `scan_container_image.sh` | **Pending** — blocked on a completed validator run |
+| `validate_container_image.sh` | **Pass, after one fix** — a blank-record parsing bug produced a false `" 8000/tcp"` mismatch. With the parser corrected and the exact-port policy intact, the validator runs to completion and every confinement assertion passes on the live image. |
+| `generate_image_sbom.sh` | **Pass** — CycloneDX image SBOM produced for the exact image ID |
+| `scan_container_image.sh` | **Blocked on Debian, passes on Alpine** — the Debian 13 candidate recorded 23 blocking findings (4 CRITICAL, 19 HIGH) and Debian 12 Bookworm 24 (6 CRITICAL, 18 HIGH); the Alpine 3.24 candidate recorded 0 CRITICAL and 0 HIGH and is now the committed default. See [Follow-up: confinement validation, scanning, and base-image selection](#follow-up-confinement-validation-scanning-and-base-image-selection-2026-07-29). |
+| Rebuild from the committed default; production Compose stack | **Pending** — the Alpine evidence comes from a comparison build, not from the committed default |
 
 ### Fail-closed behaviour verified by execution
 
@@ -351,35 +431,39 @@ made during this audit.
 
 ## Remaining risks
 
-1. **Docker runtime confinement still unobserved.** The image now builds and its installed-wheel
-   validation passes, and Docker confirms a `65532:65532` user with `8000/tcp` as the only exposed
-   port. Everything else — read-only root, empty capability set, `NoNewPrivs`, writable `/tmp` only,
-   no Docker socket — remains test-asserted because both live attempts stopped early: first on the
-   wheel-validation invocation, then on the validator's own port parsing. Both are fixed; the
-   validator has not yet been rerun to completion. This is the primary condition on the
-   recommendation.
-2. **Base-image operating-system findings.** The 0.3.0 validation run recorded 3 CRITICAL and 19 HIGH
-   findings in `python:3.13.14-slim`, none with a published fix at the time. Prebuilt-image
-   publication stays blocked under the policy in `docs/container-image-security.md`. Publishing the
-   reviewed source repository is a separate decision and is not blocked by those findings.
-3. **Authorization is role-based and global**, not per-object. Any holder of a named permission can
+1. **The committed default has not been rebuilt and revalidated.** Container confinement is now
+   observed rather than asserted, but on a comparison build. The Alpine default must be rebuilt with
+   no `--build-arg` override and put through validation, SBOM generation, and scanning as that exact
+   artifact, and the production Compose stack must be exercised end to end against it. This is the
+   primary condition on the recommendation.
+2. **The clean base scan is point-in-time.** The Alpine 3.24 default recorded 0 CRITICAL and 0 HIGH
+   under Trivy 0.70.0 on 2026-07-29. Operating-system packages acquire advisories over time, so that
+   result must be reproduced by rescanning rather than assumed. ThreatBridge is not certified and is
+   not claimed to be free of vulnerabilities. Prebuilt-image publication remains governed by the
+   policy in `docs/container-image-security.md`; publishing the reviewed source repository is a
+   separate decision.
+3. **musl compatibility is proven only for the current locked dependency set.** `psycopg-binary` is
+   the one component with compiled artifacts and it installed and ran on musl in the validated build.
+   A future dependency addition or upgrade with compiled artifacts is also a base-compatibility
+   change, and development and CI still run on glibc.
+4. **Authorization is role-based and global**, not per-object. Any holder of a named permission can
    act on every object of that type. Denials return `403` for both existing and missing identifiers.
-4. **Imports are not one end-to-end atomic transaction.** A strict import failing midway can leave
+5. **Imports are not one end-to-end atomic transaction.** A strict import failing midway can leave
    accepted records persisted alongside a failed run record; the audit trail records this.
-5. **Import validation is heuristic**, not schema-driven: shape, size, depth, and count limits plus
+6. **Import validation is heuristic**, not schema-driven: shape, size, depth, and count limits plus
    per-type field heuristics rather than a formal JSON Schema.
-6. **The PostgreSQL container retains five capabilities** and a writable root filesystem, because its
+7. **The PostgreSQL container retains five capabilities** and a writable root filesystem, because its
    entrypoint starts as root and drops privileges. A separately administered PostgreSQL service is
    the recommended topology.
-7. **The bundled database volume has no replication, point-in-time recovery, or automated backup
+8. **The bundled database volume has no replication, point-in-time recovery, or automated backup
    schedule.** Durability is whatever the host gives that volume plus the documented manual backups.
-8. **No release signing or provenance attestation** exists yet; `docs/supply-chain.md` records it as
+9. **No release signing or provenance attestation** exists yet; `docs/supply-chain.md` records it as
    future work rather than claiming it.
-9. **No malware scanning or quarantine.** ThreatBridge parses files as data and never executes them,
-   but an operator accepting untrusted uploads must add both.
-10. **Container isolation is defence in depth, not a boundary.** A host kernel or runtime
+10. **No malware scanning or quarantine.** ThreatBridge parses files as data and never executes them,
+    but an operator accepting untrusted uploads must add both.
+11. **Container isolation is defence in depth, not a boundary.** A host kernel or runtime
     vulnerability can defeat the profile.
-11. **The workflows have never run on GitHub.** Hosted permissions, CodeQL availability, and
+12. **The workflows have never run on GitHub.** Hosted permissions, CodeQL availability, and
     Dependabot behaviour cannot be proven locally.
 
 ## Items requiring repository-owner configuration in GitHub
@@ -457,7 +541,11 @@ On a host with a working Docker daemon, additionally:
 ```bash
 docker compose -f compose.production.yml config
 docker compose -f compose.production.yml -f compose.production.step-ca.yml config
+# Rebuild from the committed Alpine default: no --build-arg override, so the image
+# under test is the one a third party gets from a plain `docker build`.
 docker build --no-cache -t threatbridge-release-candidate:local .
+docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.name"}}' \
+    threatbridge-release-candidate:local
 ./scripts/validate_container_image.sh threatbridge-release-candidate:local
 ./scripts/generate_image_sbom.sh threatbridge-release-candidate:local
 ./scripts/scan_container_image.sh threatbridge-release-candidate:local
@@ -473,25 +561,32 @@ deployment checks under a synthetic production environment, dependency-lock and 
 and Gitleaks against both the candidate tree and all reachable history. No secret exists in the tree
 or in history, no history rewrite is needed, and every fail-closed guard was proven by execution.
 
-READY is withheld for one reason: the container runtime confinement is asserted by tests rather than
-observed. The image itself now builds cleanly, proves its wheel is authoritative, and reports the
-expected user and single exposed port. Two live attempts stopped before the confinement checks — the
-first on the wheel-validation invocation, the second on the validator's own port parsing — and both
-defects were in the tooling rather than the image. That is a gap in evidence, not a known defect, but
-it is not yet closed.
+Container runtime confinement is now **observed rather than asserted**: the validator ran to completion
+against a live image and proved the non-root identity, read-only root filesystem, empty capability
+sets, `NoNewPrivs=1`, `/tmp`-only writability, absent Docker socket, authoritative installed wheel, and
+single exposed port. The default base was moved to the Alpine 3.24 candidate that recorded zero HIGH or
+CRITICAL findings under the reviewed Trivy 0.70.0 policy.
+
+READY is withheld because that evidence belongs to comparison builds rather than to the committed
+default. **A prebuilt image is explicitly not READY.** Two outstanding items are gaps in evidence
+rather than known defects, and both are mechanical.
 
 ### Conditions before publication
 
-1. On a host with Docker, run `scripts/validate_container_image.sh` to completion against the built
-   image with the corrected port parsing, plus the Compose commands above. All must pass, including
-   the hardened validation run that proves a non-root UID, read-only root filesystem, empty capability
-   set, `NoNewPrivs=1`, a writable `/tmp`, no Docker socket, and the single expected exposed port.
-2. Re-resolve the base-image digests and rerun the unsuppressed image scan. Prebuilt-image
-   publication stays blocked while any HIGH or CRITICAL finding is unfixed; source publication is a
-   separate decision.
-3. Apply the GitHub repository settings listed above, then confirm every workflow succeeds on the
+1. On a host with Docker, rebuild from the committed default — `docker build --no-cache` with no
+   `--build-arg` override — then run `scripts/validate_container_image.sh`,
+   `scripts/generate_image_sbom.sh`, and `scripts/scan_container_image.sh` against that exact image ID.
+   All must pass, including the hardened validation run that proves a non-root UID, read-only root
+   filesystem, empty capability set, `NoNewPrivs=1`, a writable `/tmp`, no Docker socket, and the
+   single expected exposed port.
+2. Start the production Compose stack end to end against that image and confirm the `deploy-check`
+   gate, migrations, PostgreSQL connectivity, and readiness, plus the Compose commands above.
+3. Re-resolve the base-image digests and rerun the unsuppressed image scan immediately before release,
+   since the clean Alpine result is point-in-time. Prebuilt-image publication stays blocked while any
+   HIGH or CRITICAL finding is unfixed; source publication is a separate decision.
+4. Apply the GitHub repository settings listed above, then confirm every workflow succeeds on the
    public host.
-4. Have an independent reviewer confirm private-file exclusion and this evidence, per
+5. Have an independent reviewer confirm private-file exclusion and this evidence, per
    `docs/release-checklist.md`.
 
 No risk was accepted silently, no scanner finding was suppressed, and no test was weakened.
