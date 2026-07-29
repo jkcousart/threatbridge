@@ -63,7 +63,7 @@ RUN DJANGO_DEBUG=false \
     && chmod 0755 /runtime/app/manage.py \
     && chmod 0644 /runtime/app/LICENSE /runtime/app/NOTICE \
     && chmod 0750 /runtime/app/data \
-    && /opt/runtime-venv/bin/python -c 'import importlib.util, pathlib, sysconfig, catalog, integrations, threatbridge; site = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve(); modules = (catalog, integrations, threatbridge); assert all(pathlib.Path(module.__file__).resolve().is_relative_to(site) for module in modules); assert importlib.util.find_spec("pip") is None' \
+    && /opt/runtime-venv/bin/python -P -c 'import importlib.util, pathlib, sysconfig, catalog, integrations, threatbridge; site = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve(); modules = (catalog, integrations, threatbridge); assert all(pathlib.Path(module.__file__).resolve().is_relative_to(site) for module in modules); assert importlib.util.find_spec("pip") is None' \
     && test ! -e /runtime/app/.secrets \
     && test ! -e /runtime/app/catalog \
     && test ! -e /runtime/app/integrations \

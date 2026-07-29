@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -306,6 +309,65 @@ def test_docker_final_stage_uses_only_the_installed_wheel() -> None:
 
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'exclude = ["*.tests", "*.tests.*"]' in pyproject
+
+
+def test_wheel_validation_cannot_be_satisfied_by_the_build_directory(
+    tmp_path: Path,
+) -> None:
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    # The builder copies the source trees into its working directory, which is exactly
+    # what the validation must not be allowed to import.
+    assert "WORKDIR /build" in dockerfile
+    for package in ("catalog", "integrations", "threatbridge"):
+        assert f"COPY {package} ./{package}" in dockerfile, package
+
+    validations = [
+        line for line in dockerfile.splitlines() if "catalog, integrations, threatbridge" in line
+    ]
+    assert len(validations) == 1, validations
+    invocation = re.search(
+        r"(?P<safe_path>PYTHONSAFEPATH=\S+\s+)?"
+        r"/opt/runtime-venv/bin/python(?P<flags>(?:\s+-\w+)*)\s+-c\s+'(?P<program>.*)'",
+        validations[0],
+    )
+    assert invocation is not None, validations[0]
+
+    flags = invocation["flags"].split()
+    assert invocation["safe_path"] or {"-P", "-I"} & set(flags), (
+        "The installed-wheel validation must run in safe-path mode, or the build "
+        f"directory shadows the wheel it is meant to prove: {validations[0]}"
+    )
+
+    program = invocation["program"]
+    assert 'sysconfig.get_paths()["purelib"]' in program
+    assert "is_relative_to(site)" in program
+    assert 'importlib.util.find_spec("pip") is None' in program
+
+    # Prove the flag actually has the semantics the Dockerfile relies on, rather than
+    # trusting that it is spelled correctly.
+    shadow = tmp_path / "catalog"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("", encoding="utf-8")
+    probe = "import catalog; print(catalog.__file__)"
+
+    unprotected = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert unprotected.stdout.strip() == str(shadow / "__init__.py")
+
+    protected = subprocess.run(
+        [sys.executable, "-P", "-c", probe],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert str(tmp_path) not in protected.stdout
 
 
 def test_generated_image_evidence_stays_out_of_source_candidate() -> None:

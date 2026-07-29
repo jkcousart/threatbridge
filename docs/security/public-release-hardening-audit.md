@@ -41,12 +41,48 @@ the deferred product roadmap.
 - Structural verification of the Compose profiles by parsing them and asserting the confinement
   contract in `tests/test_deployment_tooling.py`.
 
-**Limitation.** The Docker daemon is unavailable in this WSL 2 distribution
-(`docker version` reports the CLI cannot reach a daemon). No image was built, no container was run,
-and `docker compose config` was not executed. Every Docker and Compose statement in this document is
-therefore a static or test-asserted claim, not observed runtime behaviour. The commands an operator
-must run on a Docker host to close this gap are listed under
-[Conditions before publication](#conditions-before-publication).
+**Limitation.** The Docker daemon was unavailable in the WSL 2 distribution used for the audit pass
+(`docker version` reported the CLI could not reach a daemon). At that point no image was built, no
+container was run, and `docker compose config` was not executed. Every Docker and Compose statement
+in this document is a static or test-asserted claim rather than observed runtime behaviour, except
+where the follow-up below says otherwise. The commands an operator must run on a Docker host to close
+this gap are listed under [Conditions before publication](#conditions-before-publication).
+
+### Follow-up: live build attempt (2026-07-29)
+
+A live build was attempted on a host with a working Docker daemon after the audit commit. It failed
+in the builder stage, at the installed-wheel validation:
+
+```text
+/opt/runtime-venv/bin/python -c 'import ... catalog, integrations, threatbridge ...'
+```
+
+The builder `WORKDIR` is `/build`, and `catalog`, `integrations`, and `threatbridge` are copied there
+earlier in the stage. For `python -c`, CPython prepends the current directory to `sys.path`, so those
+source trees were imported instead of the wheel installed under
+`/opt/runtime-venv/lib/python3.13/site-packages`, and the assertion that every module originates from
+site-packages failed.
+
+**The validation behaved exactly as designed.** It is there to prove the wheel is authoritative, and
+it correctly refused a build in which the packages resolved somewhere else. The defect was in the
+invocation, not the check: the interpreter was allowed to see the build directory at all.
+
+The fix is one flag. The invocation now uses `python -P`, CPython's safe-path mode, which omits the
+script directory and the current directory from `sys.path`. Both assertions are unchanged: every
+ThreatBridge package must resolve inside the runtime virtual environment's site-packages, and `pip`
+must be absent from that environment. Nothing was relaxed, no path was added to the allowed set, and
+the check still fails closed.
+
+`tests/test_release_tooling.py::test_wheel_validation_cannot_be_satisfied_by_the_build_directory`
+guards the regression. It asserts that the source trees really are copied into the builder working
+directory, that the single validation invocation enables safe-path mode, that both assertions are
+still present, and — by running the real interpreter against a decoy package — that safe-path mode
+actually suppresses the shadowing it is relied upon to suppress.
+
+**Live runtime validation remains pending.** The corrected image has not yet been built and validated
+end to end. Until a rebuilt image passes `scripts/validate_container_image.sh` and
+`scripts/scan_container_image.sh`, the Docker runtime controls stay in the same state as before this
+follow-up: asserted, not observed.
 
 ## Findings by severity
 
@@ -189,8 +225,9 @@ pip-audit 2.10.1, Trivy 0.70.0, Gitleaks (build-stamped version string).
 | Gitleaks, candidate tree | **Pass** — no leaks |
 | Gitleaks, all 14 reachable commits | **Pass** — no leaks |
 | SBOM regeneration byte-comparison | **Pass** — matches `sbom/threatbridge.cdx.json` |
-| `docker compose config` (both profiles) | **Not run** — no Docker daemon available |
-| Image build, `validate_container_image.sh`, `scan_container_image.sh` | **Not run** — no Docker daemon available |
+| `docker compose config` (both profiles) | **Not run** — no Docker daemon available during the audit pass |
+| Image build | **Failed, then fixed** — the builder working directory shadowed the installed wheel, so the wheel validation correctly refused the build. Corrected to `python -P`; a rebuild has not yet been run. See [Follow-up: live build attempt](#follow-up-live-build-attempt-2026-07-29). |
+| `validate_container_image.sh`, `scan_container_image.sh` | **Pending** — blocked on a successful rebuild |
 
 ### Fail-closed behaviour verified by execution
 
@@ -260,8 +297,10 @@ made during this audit.
 
 ## Remaining risks
 
-1. **Docker runtime unverified in this environment.** Container and Compose claims are static and
-   test-asserted only. This is the primary condition on the recommendation.
+1. **Docker runtime still unverified.** Container and Compose claims are static and test-asserted
+   only. The first live build failed at the installed-wheel validation because the builder working
+   directory shadowed the wheel; that invocation now uses safe-path mode, but the rebuilt image has
+   not yet completed validation. This is the primary condition on the recommendation.
 2. **Base-image operating-system findings.** The 0.3.0 validation run recorded 3 CRITICAL and 19 HIGH
    findings in `python:3.13.14-slim`, none with a published fix at the time. Prebuilt-image
    publication stays blocked under the policy in `docs/container-image-security.md`. Publishing the
@@ -377,15 +416,18 @@ deployment checks under a synthetic production environment, dependency-lock and 
 and Gitleaks against both the candidate tree and all reachable history. No secret exists in the tree
 or in history, no history rewrite is needed, and every fail-closed guard was proven by execution.
 
-READY is withheld for one reason: no Docker daemon was available, so the container and Compose
-controls are asserted statically and by tests rather than observed. That is a gap in evidence, not a
-known defect.
+READY is withheld for one reason: the container and Compose controls are asserted statically and by
+tests rather than observed. No Docker daemon was available during the audit pass, and the first live
+build afterwards stopped at the installed-wheel validation, which was working correctly and has since
+been given a safe-path invocation. That is a gap in evidence, not a known defect, but it is not yet
+closed.
 
 ### Conditions before publication
 
-1. On a host with Docker, run the Compose and image commands above. All must pass, including the
-   hardened validation run that proves a non-root UID, read-only root filesystem, empty capability
-   set, `NoNewPrivs=1`, a writable `/tmp`, no Docker socket, and the single expected exposed port.
+1. On a host with Docker, rebuild the image with the corrected wheel validation and run the Compose
+   and image commands above. All must pass, including the hardened validation run that proves a
+   non-root UID, read-only root filesystem, empty capability set, `NoNewPrivs=1`, a writable `/tmp`,
+   no Docker socket, and the single expected exposed port.
 2. Re-resolve the base-image digests and rerun the unsuppressed image scan. Prebuilt-image
    publication stays blocked while any HIGH or CRITICAL finding is unfixed; source publication is a
    separate decision.
