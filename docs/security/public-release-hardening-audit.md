@@ -79,10 +79,63 @@ directory, that the single validation invocation enables safe-path mode, that bo
 still present, and — by running the real interpreter against a decoy package — that safe-path mode
 actually suppresses the shadowing it is relied upon to suppress.
 
-**Live runtime validation remains pending.** The corrected image has not yet been built and validated
-end to end. Until a rebuilt image passes `scripts/validate_container_image.sh` and
-`scripts/scan_container_image.sh`, the Docker runtime controls stay in the same state as before this
-follow-up: asserted, not observed.
+### Follow-up: live image validation (2026-07-29)
+
+With the safe-path fix in place, the release-candidate image **built successfully on Docker Desktop**,
+and the builder stage's installed-wheel validation **passed**: every ThreatBridge package resolved
+inside `/opt/runtime-venv/.../site-packages` and `pip` was absent from the runtime environment. The
+wheel is authoritative in the built image.
+
+`scripts/validate_container_image.sh` then failed, but not because of anything in the image. Docker
+reported the image metadata correctly:
+
+```text
+User='65532:65532'
+ExposedPorts={'8000/tcp': {}}
+Entrypoint=None
+Cmd=<expected Gunicorn command>
+```
+
+**The image exposes only `8000/tcp`, which is the intended state.** The defect was host-side, in the
+validator's parsing. Docker's Go template emits a trailing blank record, so the raw bytes were
+`38 30 30 30 2f 74 63 70 0a 0a` — `8000/tcp\n\n`. The old pipeline sorted before discarding empty
+records, and an empty line sorts ahead of every port, so `tr '\n' ' '` produced a leading space that
+`sed 's/ $//'` did not remove. The comparison received `" 8000/tcp"` and reported:
+
+```text
+Unexpected exposed ports:  8000/tcp
+```
+
+That is a false positive from a parser bug, not a confinement failure.
+
+The parser now drops empty records before sorting, sorts under a fixed collation, and joins the
+remaining exact port records with a single space:
+
+```text
+| awk 'NF {print $1}' | LC_ALL=C sort | paste -sd ' ' -
+```
+
+**The security requirement is unchanged and was not weakened.** The check is still an exact string
+equality against `8000/tcp`. It was not relaxed to a substring or `grep` match, no additional port was
+allowed, and empty output is still rejected. Only the whitespace normalization feeding that
+comparison changed.
+
+Two parameterised regression tests in `tests/test_deployment_tooling.py` run the real validator
+against a stub `docker` that reproduces Docker's byte-for-byte output.
+`test_exposed_port_inspection_tolerates_blank_records` covers a trailing blank record, a blank record
+ahead of the port, and a bare port line, and proves normalization yields exactly `8000/tcp` by the
+fact that the equality check passes.
+`test_exposed_port_inspection_rejects_anything_but_the_single_expected_port` proves an extra TCP port,
+an extra UDP port on the same number, and an empty port set are all still rejected, with
+deterministically sorted, single-space-joined output in the message. Both tests fail against the old
+pipeline, reproducing the reported `Unexpected exposed ports:  8000/tcp` symptom.
+
+**Live confinement validation remains pending.** The corrected validator has not yet been run to
+completion against the built image, so the runtime confinement assertions — non-root UID, read-only
+root filesystem, empty capability set, `NoNewPrivs=1`, writable `/tmp` only, and no Docker socket —
+together with `scripts/scan_container_image.sh`, are still unobserved. Until
+`scripts/validate_container_image.sh` passes end to end, the Docker runtime controls stay asserted
+rather than observed.
 
 ## Findings by severity
 
@@ -226,8 +279,9 @@ pip-audit 2.10.1, Trivy 0.70.0, Gitleaks (build-stamped version string).
 | Gitleaks, all 14 reachable commits | **Pass** — no leaks |
 | SBOM regeneration byte-comparison | **Pass** — matches `sbom/threatbridge.cdx.json` |
 | `docker compose config` (both profiles) | **Not run** — no Docker daemon available during the audit pass |
-| Image build | **Failed, then fixed** — the builder working directory shadowed the installed wheel, so the wheel validation correctly refused the build. Corrected to `python -P`; a rebuild has not yet been run. See [Follow-up: live build attempt](#follow-up-live-build-attempt-2026-07-29). |
-| `validate_container_image.sh`, `scan_container_image.sh` | **Pending** — blocked on a successful rebuild |
+| Image build | **Pass, after one fix** — the first attempt failed because the builder working directory shadowed the installed wheel and the wheel validation correctly refused it. With `python -P` the image builds on Docker Desktop and the installed-wheel validation passes. See [Follow-up: live build attempt](#follow-up-live-build-attempt-2026-07-29). |
+| `validate_container_image.sh` | **Blocked by a validator bug, now fixed; rerun pending** — the image exposes only `8000/tcp`, but blank-record normalization produced `" 8000/tcp"` and reported a false positive. Parser corrected with the exact-port policy intact. See [Follow-up: live image validation](#follow-up-live-image-validation-2026-07-29). |
+| `scan_container_image.sh` | **Pending** — blocked on a completed validator run |
 
 ### Fail-closed behaviour verified by execution
 
@@ -297,10 +351,13 @@ made during this audit.
 
 ## Remaining risks
 
-1. **Docker runtime still unverified.** Container and Compose claims are static and test-asserted
-   only. The first live build failed at the installed-wheel validation because the builder working
-   directory shadowed the wheel; that invocation now uses safe-path mode, but the rebuilt image has
-   not yet completed validation. This is the primary condition on the recommendation.
+1. **Docker runtime confinement still unobserved.** The image now builds and its installed-wheel
+   validation passes, and Docker confirms a `65532:65532` user with `8000/tcp` as the only exposed
+   port. Everything else — read-only root, empty capability set, `NoNewPrivs`, writable `/tmp` only,
+   no Docker socket — remains test-asserted because both live attempts stopped early: first on the
+   wheel-validation invocation, then on the validator's own port parsing. Both are fixed; the
+   validator has not yet been rerun to completion. This is the primary condition on the
+   recommendation.
 2. **Base-image operating-system findings.** The 0.3.0 validation run recorded 3 CRITICAL and 19 HIGH
    findings in `python:3.13.14-slim`, none with a published fix at the time. Prebuilt-image
    publication stays blocked under the policy in `docs/container-image-security.md`. Publishing the
@@ -416,18 +473,19 @@ deployment checks under a synthetic production environment, dependency-lock and 
 and Gitleaks against both the candidate tree and all reachable history. No secret exists in the tree
 or in history, no history rewrite is needed, and every fail-closed guard was proven by execution.
 
-READY is withheld for one reason: the container and Compose controls are asserted statically and by
-tests rather than observed. No Docker daemon was available during the audit pass, and the first live
-build afterwards stopped at the installed-wheel validation, which was working correctly and has since
-been given a safe-path invocation. That is a gap in evidence, not a known defect, but it is not yet
-closed.
+READY is withheld for one reason: the container runtime confinement is asserted by tests rather than
+observed. The image itself now builds cleanly, proves its wheel is authoritative, and reports the
+expected user and single exposed port. Two live attempts stopped before the confinement checks — the
+first on the wheel-validation invocation, the second on the validator's own port parsing — and both
+defects were in the tooling rather than the image. That is a gap in evidence, not a known defect, but
+it is not yet closed.
 
 ### Conditions before publication
 
-1. On a host with Docker, rebuild the image with the corrected wheel validation and run the Compose
-   and image commands above. All must pass, including the hardened validation run that proves a
-   non-root UID, read-only root filesystem, empty capability set, `NoNewPrivs=1`, a writable `/tmp`,
-   no Docker socket, and the single expected exposed port.
+1. On a host with Docker, run `scripts/validate_container_image.sh` to completion against the built
+   image with the corrected port parsing, plus the Compose commands above. All must pass, including
+   the hardened validation run that proves a non-root UID, read-only root filesystem, empty capability
+   set, `NoNewPrivs=1`, a writable `/tmp`, no Docker socket, and the single expected exposed port.
 2. Re-resolve the base-image digests and rerun the unsuppressed image scan. Prebuilt-image
    publication stays blocked while any HIGH or CRITICAL finding is unfixed; source publication is a
    separate decision.

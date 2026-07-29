@@ -18,10 +18,12 @@ if docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${
     exit 1
 fi
 
+# The Go template emits a trailing blank record, which sorts ahead of every port. Drop
+# empty records before sorting so the comparison below stays an exact match.
 exposed_ports="$(
     docker image inspect \
         --format '{{range $port, $_ := .Config.ExposedPorts}}{{println $port}}{{end}}' \
-        "${image_ref}" | sort | tr '\n' ' ' | tr -s ' ' | sed 's/ $//'
+        "${image_ref}" | awk 'NF {print $1}' | LC_ALL=C sort | paste -sd ' ' -
 )"
 if [[ "${exposed_ports}" != "8000/tcp" ]]; then
     echo "Unexpected exposed ports: ${exposed_ports:-none}" >&2

@@ -160,6 +160,84 @@ def test_container_image_declares_opencontainers_provenance_labels() -> None:
     assert "runserver" not in dockerfile
 
 
+def run_image_validator(tmp_path: Path, port_output: str) -> subprocess.CompletedProcess[str]:
+    """Run the validator against a stub `docker` that emits `port_output` verbatim.
+
+    Docker's Go template ends its port list with a blank record, so the validator has to
+    normalize its own input before comparing. The stub reproduces that shape exactly and
+    fails on the first `docker run`, which is past every metadata check.
+    """
+
+    stub_directory = tmp_path / "bin"
+    stub_directory.mkdir()
+    stub = stub_directory / "docker"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "image" && "$2" == "inspect" ]]; then\n'
+        '    case "$4" in\n'
+        "        *Config.User*) printf '65532:65532\\n' ;;\n"
+        "        *Config.Env*) printf 'PATH=/opt/runtime-venv/bin\\n\\n' ;;\n"
+        '        *ExposedPorts*) printf %s "${THREATBRIDGE_STUB_PORTS}" ;;\n'
+        "        *Config.Labels*) printf 'present\\n' ;;\n"
+        "    esac\n"
+        "    exit 0\n"
+        "fi\n"
+        "echo 'stub reached docker run' >&2\n"
+        "exit 42\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return subprocess.run(
+        ["bash", str(ROOT / "scripts" / "validate_container_image.sh"), "threatbridge:test"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{stub_directory}:{os.environ['PATH']}",
+            "THREATBRIDGE_STUB_PORTS": port_output,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "port_output",
+    [
+        # The bytes Docker actually emits: the port, then the template's blank record.
+        "8000/tcp\n\n",
+        # A blank record ahead of the port, which is where sorting puts it.
+        "\n8000/tcp\n",
+        "8000/tcp\n",
+    ],
+)
+def test_exposed_port_inspection_tolerates_blank_records(tmp_path: Path, port_output: str) -> None:
+    result = run_image_validator(tmp_path, port_output)
+    # The validator compares for equality with "8000/tcp", so reaching `docker run`
+    # proves normalization produced exactly that, with no surrounding whitespace.
+    assert "Unexpected exposed ports" not in result.stderr, result.stderr
+    assert "stub reached docker run" in result.stderr
+    assert result.returncode == 42
+
+
+@pytest.mark.parametrize(
+    ("port_output", "message"),
+    [
+        # Deterministically sorted and space-joined, whatever order Docker reports.
+        ("9000/tcp\n8000/tcp\n\n", "Unexpected exposed ports: 8000/tcp 9000/tcp"),
+        ("8000/tcp\n8000/udp\n\n", "Unexpected exposed ports: 8000/tcp 8000/udp"),
+        ("\n\n", "Unexpected exposed ports: none"),
+    ],
+)
+def test_exposed_port_inspection_rejects_anything_but_the_single_expected_port(
+    tmp_path: Path, port_output: str, message: str
+) -> None:
+    result = run_image_validator(tmp_path, port_output)
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert "stub reached docker run" not in result.stderr
+
+
 def test_production_compose_runs_migrations_without_a_shell() -> None:
     compose = yaml.safe_load((ROOT / "compose.production.yml").read_text(encoding="utf-8"))
     migrate = compose["services"]["migrate"]
