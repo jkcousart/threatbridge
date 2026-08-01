@@ -126,9 +126,9 @@ charset-normalizer==3.4.9 \
 click==8.4.2 \
     --hash=sha256:9a6cea6e60b17ebe0a44c5cc636d94f09bd66142c1cd7d8b4cd731c4917a15f6 \
     --hash=sha256:e6f9f66136c816745b9d65817da91d61d957fb16e02e4dcd0552553c5a197b76
-cyclonedx-bom==7.3.0 \
-    --hash=sha256:73d7d76b3a28ebadc50eabf424cbcf128785a74b8a59ce7893da2e29cfaab585 \
-    --hash=sha256:d54080d65731980945de38e52009a5e5711f4a3c31377a3d13af96eaca5fcf3d
+cyclonedx-bom==7.3.1 \
+    --hash=sha256:8c5adccefd593e89c0500463649c232625cee8e38dae1a433e057dfa495eff08 \
+    --hash=sha256:ebd99dc2cf62a7067e327bef2b2ffada99d57ed3fda2db6c4c8f3004e5bfd3cf
 cyclonedx-python-lib==11.11.0 \
     --hash=sha256:3049fc83e06a059b5c5907a527625a8ed5073caab10607ed4c9e5503b590fd44 \
     --hash=sha256:4b3194db72b613717f2912447e67ab618c75ff7dcac6c4af3c0e9e1ac617c102
